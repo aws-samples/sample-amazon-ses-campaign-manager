@@ -1,0 +1,14 @@
+{
+  "sesExistingConfigurationSetName": "",
+  "sesRefreshScheduleCron": "cron(0 2 * * ? *)",
+  "sesDataRetentionDays": 90,
+  "sesEnableNotifications": true,
+  "sesNotificationEmail": "your-email@example.com",
+  "firehoseBufferSizeMB": 64,
+  "firehoseBufferIntervalSeconds": 0,
+  "athenaQueryResultsRetentionDays": 7,
+  "processedDataTransitionToIADays": 30,
+  "lambdaTimeoutMinutes": 15,
+  "lambdaMemoryMB": 1024,
+  "athenaQueryScanLimitGB": 10
+}

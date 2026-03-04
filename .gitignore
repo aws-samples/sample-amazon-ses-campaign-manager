@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+.kiro/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# AWS
+.aws/
+*.pem
+*.key
+
+# Application specific
+cache/
+!cache/.gitkeep
+logs/
+!logs/.gitkeep
+bulk_email_csv/bulk_email_output/
+scan_report/
+
+# Configuration (if contains sensitive data)
+config/settings.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# CDK Projects (ses_scheduled_campaigns & ses_campaign_analytics)
+ses_scheduled_campaigns/node_modules/
+ses_scheduled_campaigns/cdk.out/
+ses_scheduled_campaigns/.npmrc
+ses_campaign_analytics/node_modules/
+ses_campaign_analytics/cdk.out/
+ses_campaign_analytics/.npmrc
+*.js.map
+*.d.ts
+!jest.config.js
+# Ensure CDK lib folders are tracked
+!ses_scheduled_campaigns/lib/
+!ses_campaign_analytics/lib/
