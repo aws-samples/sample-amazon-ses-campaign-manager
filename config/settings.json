@@ -2,7 +2,7 @@
   "aws": {
     "profile": "default",
     "region": "us-east-1",
-    "last_used": "2025-10-17T16:36:47.381516"
+    "last_used": null
   },
   "ui": {
     "theme": "dark",
@@ -10,11 +10,11 @@
   },
   "email": {
     "default_template_data": {},
-    "unsubscribe_encryption_key": "nQiuJ2OHolEDHBaHK412SpIdUIXln1r2r7tWtZfyp7I=",
-    "unsubscribe_base_url": "https://www.hello.com",
-    "unsubscribe_endpoint_url": "https://www.hello.com",
-    "unsubscribe_mailto": "unsubscribe@mailme.com",
-    "default_configuration_set": "ses-analytics-753631027292",
+    "unsubscribe_encryption_key": "",
+    "unsubscribe_base_url": "",
+    "unsubscribe_endpoint_url": "",
+    "unsubscribe_mailto": "",
+    "default_configuration_set": "",
     "max_retries": 3,
     "base_retry_delay": 1.0
   },
@@ -32,10 +32,10 @@
   },
   "app": {
     "version": "1.0.0",
-    "last_updated": "2026-03-04T10:11:36.256048",
-    "debug_logging": true,
-    "verbose_notifications": true,
-    "max_log_size_mb": 7.0,
-    "max_backup_logs": 5
+    "last_updated": null,
+    "debug_logging": false,
+    "verbose_notifications": false,
+    "max_log_size_mb": 10.0,
+    "max_backup_logs": 3
   }
 }
