@@ -158,9 +158,12 @@ def handler(event, context):
             is_throttling = error_code in ['Throttling', 'ThrottlingException', 'TooManyRequestsException']
             
             # Check if it's a permanent error
-            permanent_errors = ['MessageRejected', 'MailFromDomainNotVerifiedException', 
+            permanent_errors = ['MessageRejected', 'MailFromDomainNotVerifiedException',
                               'TemplateDoesNotExist', 'ConfigurationSetDoesNotExist',
-                              'AccountSendingPausedException']
+                              'AccountSendingPausedException', 'InvalidParameterValue',
+                              'InvalidTemplateData', 'AccessDeniedException',
+                              'ValidationError', 'InvalidClientTokenId',
+                              'SignatureDoesNotMatch']
             is_permanent = error_code in permanent_errors
             
             if is_throttling:
@@ -195,17 +198,12 @@ def handler(event, context):
                     failed=1
                 )
             else:
-                # Unknown error - requeue to try again
-                print(f'Unknown error, requeuing: {str(e)}')
-                sqs.send_message(
-                    QueueUrl=os.environ['EMAIL_QUEUE_URL'],
-                    MessageBody=json.dumps(message)
-                )
-                # Delete original message
-                sqs.delete_message(
-                    QueueUrl=os.environ['EMAIL_QUEUE_URL'],
-                    ReceiptHandle=receipt_handle
-                )
+                # Unknown error - let SQS handle retry via maxReceiveCount + DLQ
+                # Do NOT delete or requeue: leaving the message in-flight makes it
+                # reappear after the visibility timeout, incrementing its receive
+                # count until it hits the DLQ.
+                print(f'Unknown error, leaving for SQS retry: {str(e)}')
+                raise
     
     # Check if campaign is complete (periodically)
     if event['Records']:
