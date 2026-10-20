@@ -7,7 +7,7 @@ import * as config from '../config.json';
 const app = new cdk.App();
 
 new SesScheduledCampaignsStack(app, 'SesScheduledCampaignsStack', {
-  campaignRetentionDays: 90, // Hardcoded: Days to retain campaign metadata
+  campaignRetentionDays: 90, // Hardcoded: Days to keep campaign records (status, sent/failed counts) after the send
   csvRetentionDays: 30, // Hardcoded: Days to retain CSV files in S3
   enableNotifications: config.enableNotifications,
   notificationEmail: config.notificationEmail || undefined,
@@ -17,10 +17,12 @@ new SesScheduledCampaignsStack(app, 'SesScheduledCampaignsStack', {
   sendingRateTPS: config.sendingRateTPS,
   sqsVisibilityTimeout: config.sqsVisibilityTimeout,
   sqsMessageRetention: 345600, // Hardcoded: 4 days in seconds
-  sqsMaxReceiveCount: 3, // Hardcoded: Max retry attempts before DLQ
+  sqsMaxReceiveCount: 5, // Hardcoded: Max retry attempts before DLQ (AWS recommends >= 5 for Lambda triggers)
   dlqMessageRetention: 1209600, // Hardcoded: 14 days in seconds
   enablePointInTimeRecovery: false, // Hardcoded: DynamoDB PITR disabled
   unsubscribeEncryptionKey: config.unsubscribeEncryptionKey,
+  // Optional field - read loosely so config.json files from older versions still compile
+  unsubscribeEncryptionKeyParameter: (config as Record<string, any>).unsubscribeEncryptionKeyParameter || undefined,
   unsubscribeBaseUrl: config.unsubscribeBaseUrl,
   unsubscribeEndpointUrl: config.unsubscribeEndpointUrl,
   unsubscribeMailto: config.unsubscribeMailto,

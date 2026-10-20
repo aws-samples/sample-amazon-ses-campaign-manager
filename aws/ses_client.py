@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
 
 from modules.cache_manager import CacheManager, CachedAPIWrapper
 from modules.logger import get_logger
-from config.settings import Settings
+from config.settings import settings as global_settings
 
 
 class SESClient:
@@ -25,10 +25,12 @@ class SESClient:
         self.session = None
         self.ses_client = None
         
-        # Initialize caching
-        self.settings = settings or Settings()
-        self.cache_manager = CacheManager(self.settings)
+        # Initialize caching, scoped to this profile and region so accounts never share cached data.
+        # Other modules use this shared cache through ses_client.cache_manager / ses_client.cached_api
+        self.settings = settings or global_settings
+        self.cache_manager = CacheManager(self.settings, namespace=f"{profile_name or 'default'}_{self.region_name}")
         self.cached_api = CachedAPIWrapper(self.cache_manager)
+        self.cache_manager.cleanup_expired_cache()
         
         # Debug logging
         logger = get_logger()
@@ -79,13 +81,26 @@ class SESClient:
                 logger.error(f"Failed to initialize AWS session: {str(e)}", "SES_CLIENT")
             raise Exception(f"Failed to initialize AWS session: {str(e)}")
     
+    def _iter_pages(self, list_function, **kwargs):
+        """Yield every page of an SES v2 list call (boto3 has no paginators for these)."""
+        while True:
+            response = list_function(**kwargs)
+            yield response
+            if not response.get('NextToken'):
+                return
+            kwargs['NextToken'] = response['NextToken']
+    
     def get_templates(self, force_refresh: bool = False):
         """Fetch all email templates with caching support."""
         def _fetch_templates():
-            response = self.ses_client.list_email_templates()
             templates = []
+            template_infos = [
+                template_info
+                for page in self._iter_pages(self.ses_client.list_email_templates, PageSize=100)
+                for template_info in page.get('TemplatesMetadata', [])
+            ]
             
-            for template_info in response.get('TemplatesMetadata', []):
+            for template_info in template_infos:
                 template_name = template_info['TemplateName']
                 created_timestamp = template_info.get('CreatedTimestamp')
                 
@@ -174,8 +189,11 @@ class SESClient:
     def get_identities(self, force_refresh: bool = False):
         """Fetch all verified identities with caching support."""
         def _fetch_identities():
-            response = self.ses_client.list_email_identities()
-            return [identity['IdentityName'] for identity in response.get('EmailIdentities', [])]
+            return [
+                identity['IdentityName']
+                for page in self._iter_pages(self.ses_client.list_email_identities, PageSize=1000)
+                for identity in page.get('EmailIdentities', [])
+            ]
         
         try:
             # Use cached API wrapper for identities
@@ -192,10 +210,12 @@ class SESClient:
     def get_configuration_sets(self, force_refresh: bool = False):
         """Fetch all configuration sets with caching support."""
         def _fetch_configuration_sets():
-            response = self.ses_client.list_configuration_sets()
-            
             # Handle the response structure properly
-            config_sets = response.get('ConfigurationSets', [])
+            config_sets = [
+                config_set
+                for page in self._iter_pages(self.ses_client.list_configuration_sets)
+                for config_set in page.get('ConfigurationSets', [])
+            ]
             
             # Extract configuration set names - handle both possible response formats
             result = []
@@ -220,6 +240,48 @@ class SESClient:
             )
         except Exception as e:
             raise Exception(f"Error fetching configuration sets: {str(e)}")
+    
+    def get_account_details(self, force_refresh: bool = False):
+        """Fetch SES account details (sending quota, enforcement status) with caching support."""
+        def _fetch_account_details():
+            response = self.ses_client.get_account()
+            response.pop('ResponseMetadata', None)
+            return response
+        
+        try:
+            ttl_minutes = self.settings.get('cache.dashboard_ttl_minutes', 10)
+            return self.cached_api.cached_call(
+                operation_name="get_account_details",
+                api_function=_fetch_account_details,
+                ttl_minutes=ttl_minutes,
+                force_refresh=force_refresh
+            )
+        except Exception as e:
+            raise Exception(f"Error fetching account details: {str(e)}")
+    
+    def get_suppression_count(self, force_refresh: bool = False):
+        """Count suppressed destinations with caching support.
+        
+        Only the first page is counted to stay within the 1 TPS management API limit;
+        'has_more' is True when the list continues past it.
+        """
+        def _fetch_suppression_count():
+            response = self.ses_client.list_suppressed_destinations()
+            return {
+                'count': len(response.get('SuppressedDestinationSummaries', [])),
+                'has_more': bool(response.get('NextToken'))
+            }
+        
+        try:
+            ttl_minutes = self.settings.get('cache.dashboard_ttl_minutes', 10)
+            return self.cached_api.cached_call(
+                operation_name="get_suppression_count",
+                api_function=_fetch_suppression_count,
+                ttl_minutes=ttl_minutes,
+                force_refresh=force_refresh
+            )
+        except Exception as e:
+            raise Exception(f"Error fetching suppression list: {str(e)}")
     
     def extract_template_placeholders(self, template_name: str):
         """Extract placeholders from a template and return a dict with placeholder keys and example values."""

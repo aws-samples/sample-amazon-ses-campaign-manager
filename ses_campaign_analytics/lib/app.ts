@@ -20,6 +20,7 @@ const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 const sesStack = new SesCampaignAnalyticsStack(app, 'SesCampaignAnalyticsStack', {
   existingConfigurationSetName: config.sesExistingConfigurationSetName,
   refreshScheduleCron: config.sesRefreshScheduleCron,
+  refreshLookbackDays: config.sesRefreshLookbackDays ?? 14,
   dataRetentionDays: config.sesDataRetentionDays,
   enableNotifications: config.sesEnableNotifications,
   notificationEmail: config.sesNotificationEmail,

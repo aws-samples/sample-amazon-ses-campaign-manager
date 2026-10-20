@@ -15,12 +15,17 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as ses from 'aws-cdk-lib/aws-ses';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import { NagSuppressions } from 'cdk-nag';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
 
 export interface SesCampaignAnalyticsStackProps extends cdk.StackProps {
   existingConfigurationSetName?: string;
   refreshScheduleCron: string;
+  refreshLookbackDays: number;
   dataRetentionDays: number;
   enableNotifications: boolean;
   notificationEmail?: string;
@@ -77,21 +82,13 @@ export class SesCampaignAnalyticsStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       removalPolicy: RemovalPolicy.RETAIN,
       enforceSSL: true,
+      // No Glacier transition: Athena silently skips Glacier objects, so older events would
+      // vanish from queries and refreshes, and per-object fees outweigh savings for small files
       lifecycleRules: [
         {
           id: 'DeleteOldRawData',
           enabled: true,
           expiration: Duration.days(props.dataRetentionDays),
-        },
-        {
-          id: 'TransitionToGlacier',
-          enabled: true,
-          transitions: [
-            {
-              storageClass: s3.StorageClass.GLACIER,
-              transitionAfter: Duration.days(Math.floor(props.dataRetentionDays / 3)),
-            },
-          ],
         },
       ],
     });
@@ -223,7 +220,25 @@ TBLPROPERTIES (
 )`,
     });
 
-    // Lambda to execute the named query and create the table
+    // Views from sql/ (comment lines stripped - Athena DDL must start with the statement)
+    const viewFiles = ['campaign_summary_view.sql', 'campaign_realtime_view.sql'];
+    const viewSql = viewFiles.map((file) =>
+      fs.readFileSync(path.join(__dirname, '../sql', file), 'utf-8')
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n')
+        .trim(),
+    );
+    const viewQueries = viewSql.map((queryString, index) =>
+      new athena.CfnNamedQuery(this, `CreateView${index}`, {
+        database: this.glueDatabase.ref,
+        description: `Create view from sql/${viewFiles[index]}`,
+        name: `create_${viewFiles[index].replace('.sql', '')}`,
+        queryString,
+      }),
+    );
+
+    // Lambda to execute the named queries and create the table and views
     const createTableLambda = new lambda.Function(this, 'CreateTableLambda', {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'createTable.handler',
@@ -231,6 +246,7 @@ TBLPROPERTIES (
       timeout: Duration.minutes(10), // Increased from 5 to 10 minutes for Athena query completion
       environment: {
         NAMED_QUERY_ID: createTableQuery.attrNamedQueryId,
+        VIEW_QUERY_IDS: cdk.Fn.join(',', viewQueries.map((query) => query.attrNamedQueryId)),
         DATABASE_NAME: this.glueDatabase.ref,
         OUTPUT_LOCATION: `s3://${this.athenaResultsBucket.bucketName}/table-creation/`,
       },
@@ -255,6 +271,7 @@ TBLPROPERTIES (
           'glue:GetDatabase',
           'glue:GetTable',
           'glue:CreateTable',
+          'glue:UpdateTable', // CREATE OR REPLACE VIEW
         ],
         resources: [
           `arn:aws:glue:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:catalog`,
@@ -279,10 +296,15 @@ TBLPROPERTIES (
     // Custom resource to trigger table creation
     const tableCreationTrigger = new cdk.CustomResource(this, 'TableCreationTrigger', {
       serviceToken: createTableLambda.functionArn,
+      properties: {
+        // Re-run (and re-create the views) whenever the view SQL changes
+        ViewsHash: crypto.createHash('sha256').update(viewSql.join('\n')).digest('hex'),
+      },
     });
 
     tableCreationTrigger.node.addDependency(this.glueDatabase);
     tableCreationTrigger.node.addDependency(createTableQuery);
+    viewQueries.forEach((query) => tableCreationTrigger.node.addDependency(query));
 
     // Reference for Firehose - use the table name directly
     const rawEventsTableName = 'ses_events_raw';
@@ -341,6 +363,8 @@ TBLPROPERTIES (
         },
       },
     });
+
+    tableCreationTrigger.node.addDependency(campaignMetricsTable);
 
     //////// ATHENA WORKGROUP ////////
     
@@ -551,6 +575,7 @@ TBLPROPERTIES (
         ATHENA_OUTPUT_LOCATION: `s3://${this.athenaResultsBucket.bucketName}/refresh-results/`,
         WORKGROUP_NAME: this.workGroup.ref,
         NOTIFICATION_TOPIC_ARN: notificationTopic?.topicArn || '',
+        REFRESH_LOOKBACK_DAYS: String(props.refreshLookbackDays),
       },
     });
 
@@ -609,21 +634,10 @@ TBLPROPERTIES (
       environment: {
         DATABASE_NAME: this.glueDatabase.ref,
         TABLE_NAME: rawEventsTableName,
-        OUTPUT_LOCATION: `s3://${this.athenaResultsBucket.bucketName}/partition-mgmt/`,
       },
     });
 
-    // Grant permissions to partition Lambda
-    this.rawDataBucket.grantRead(athenaPartitionLambda);
-    this.athenaResultsBucket.grantReadWrite(athenaPartitionLambda);
-
-    athenaPartitionLambda.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['athena:StartQueryExecution'],
-        resources: [`arn:aws:athena:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:workgroup/*`],
-      }),
-    );
-
+    // Grant permissions to partition Lambda (partitions are created through the Glue API)
     athenaPartitionLambda.addToRolePolicy(
       new iam.PolicyStatement({
         actions: [
@@ -667,8 +681,9 @@ TBLPROPERTIES (
       timeToLiveAttribute: 'ttl',
     });
 
-    // Grant Lambda read/write access to DynamoDB (for potential future automation)
+    // Refresh Lambda keeps a lock item in this table so overlapping refreshes don't double-count
     campaignMetadataTable.grantReadWriteData(refreshLambda);
+    refreshLambda.addEnvironment('METADATA_TABLE_NAME', campaignMetadataTable.tableName);
 
     //////// EVENTBRIDGE RULE FOR SCHEDULED REFRESH ////////
     
@@ -678,6 +693,70 @@ TBLPROPERTIES (
     });
 
     refreshRule.addTarget(new targets.LambdaFunction(refreshLambda));
+
+    //////// ALARMS ////////
+
+    const firehoseMetric = (metricName: string, statistic: string) =>
+      new cloudwatch.Metric({
+        namespace: 'AWS/Firehose',
+        metricName,
+        dimensionsMap: { DeliveryStreamName: deliveryStream.ref },
+        statistic,
+        period: Duration.minutes(5),
+      });
+
+    const alarms = [
+      new cloudwatch.Alarm(this, 'RefreshErrorsAlarm', {
+        alarmDescription: 'Materialized view refresh failed - campaign metrics may be stale',
+        metric: refreshLambda.metricErrors({ period: Duration.minutes(5) }),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'PartitionErrorsAlarm', {
+        alarmDescription: 'Raw event partitions could not be registered - events will be missing from analytics',
+        metric: athenaPartitionLambda.metricErrors({ period: Duration.minutes(5) }),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'FirehoseConversionFailuresAlarm', {
+        alarmDescription: 'SES events failed Parquet conversion and were written to the errors/ prefix',
+        metric: firehoseMetric('FailedConversion.Records', 'Sum'),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'FirehoseDeliveryFailuresAlarm', {
+        alarmDescription: 'Firehose failed to deliver SES events to S3',
+        metric: firehoseMetric('DeliveryToS3.Success', 'Minimum'),
+        threshold: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ];
+
+    if (notificationTopic) {
+      // The topic policy replaces SNS's default policy, so CloudWatch needs an explicit allow
+      notificationTopic.addToResourcePolicy(
+        new iam.PolicyStatement({
+          actions: ['sns:Publish'],
+          resources: [notificationTopic.topicArn],
+          principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
+          conditions: {
+            ArnLike: { 'aws:SourceArn': `arn:aws:cloudwatch:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:alarm:*` },
+          },
+        }),
+      );
+
+      for (const alarm of alarms) {
+        alarm.addAlarmAction(new cloudwatchActions.SnsAction(notificationTopic));
+      }
+    }
 
     //////// OUTPUTS ////////
     

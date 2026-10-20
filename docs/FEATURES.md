@@ -26,7 +26,7 @@ Displays cached SES account details (refreshed on demand):
 - **Maximum Send Rate**: Emails per second allowed
 - **Account Status**: Production or sandbox mode
 
-**Why cached?** Amazon SES management APIs are limited to 1 TPS. Caching prevents rate limit errors while keeping data reasonably fresh (60-minute TTL).
+**Why cached?** Amazon SES management APIs are limited to 1 TPS. Caching prevents rate limit errors while keeping data reasonably fresh (10-minute TTL).
 
 ### Metrics Visualization
 
@@ -199,24 +199,26 @@ Automatically saved to `bulk_email_csv/bulk_email_output/`:
 **Form Fields**:
 All bulk email fields (CSV, campaign name, etc.) plus:
 - **Schedule Date & Time**: Future datetime in `YYYY-MM-DD HH:MM` format (24-hour)
-- Validation ensures schedule time is in the future
+- Validation ensures schedule time is in the future. If it is less than a minute away by the time the campaign is created, it starts immediately
+- When unsubscribe is enabled, the stack checks that its encryption key matches the one in Settings and rejects the campaign if it doesn't
+- A warning is shown if the analytics configuration set isn't selected (the campaign wouldn't appear in Campaign Analytics)
 
 **How It Works**:
 1. CSV uploaded to S3 bucket
-2. DynamoDB entry created with TTL (execution time + 1 hour)
+2. DynamoDB entry created (kept for 90 days after the scheduled time)
 3. EventBridge rule created for scheduled time
 4. Campaign metadata written to analytics table (if deployed)
 5. At scheduled time, EventBridge triggers Lambda
-6. Lambda reads CSV, processes recipients, adds messages to SQS
+6. Lambda reads CSV, processes recipients, adds messages to SQS, then deletes the CSV
 7. Separate Lambda (EmailSender) reads from SQS and sends emails
-8. 1 hour after execution, TTL expires and cleanup Lambda removes resources
+8. Campaign is marked COMPLETED once every recipient was sent or failed (failed emails go to the dead-letter queue with their error)
 
 **Sending Rate Configuration**:
-Rate controlled by EmailSender Lambda concurrency settings (not per-campaign):
-- **Default**: 1 TPS
-- **To adjust**: AWS Console → Lambda → EmailSender → Configuration → Concurrency
-- **Formula**: Reserved Concurrency × 20 = Target TPS
-- **Example**: 5 reserved concurrency = ~100 TPS
+Rate is set by `sendingRateTPS` in `ses_scheduled_campaigns/config.json` and applies to all campaigns:
+- **Default**: 100 TPS
+- **To adjust**: Change `sendingRateTPS` and run `cdk deploy`
+- **How**: SQS trigger maximum concurrency `ceil(TPS / 20)`, and each invocation paces its sends so the total never exceeds `sendingRateTPS`
+- Keep it at or below your SES account's maximum send rate
 
 **Benefits**:
 - Schedule days/weeks in advance
@@ -340,8 +342,9 @@ If campaign metadata was stored:
 
 ### Important Notes
 
-- **Campaign Tag Required**: Emails must include `campaign` tag to appear in analytics
-- **Configuration Set**: Must use CDK-deployed config set when sending
+- **Campaign Tags Required**: Emails must include `campaign_id` and `campaign_name` tags to appear in analytics (added automatically)
+- **Configuration Set**: Must use CDK-deployed config set when sending (selected by default)
+- **Send-Date Attribution**: Metrics are grouped by the day emails were sent; opens, clicks and bounces that arrive later count toward that day
 - **Data Timing**: Automatic nightly processing + optional manual processing for current day
 - **Hidden Campaigns**: Soft delete feature for organizing campaign view
 
@@ -349,25 +352,30 @@ If campaign metadata was stored:
 
 ## Scheduled Campaigns Tab
 
-View and manage scheduled email campaigns awaiting execution.
+View and manage scheduled email campaigns, from scheduling through completion.
 
 **Requirements**: [ses-scheduled-campaigns](../../ses_scheduled_campaigns/) CDK stack deployed in same region.
 
 ### Campaign Management
 
-**View Upcoming Campaigns**:
-- Table shows only future campaigns (past campaigns auto-filtered)
-- Columns: Name, ID, Scheduled Time, Template, From Email, Recipients, Status
+**View Campaigns**:
+- Table shows campaigns of every status (scheduled, sending, completed, failed, stopped, cancelled), newest first
+- Columns: Name, ID, Scheduled Time, Status, Progress (sent/failed of total), Template, From Email
 - Click row to view details
 
 **Campaign Details Panel**:
 - Campaign metadata: name, ID, scheduled time
 - Configuration: template, from address, config set
-- S3 CSV file location
+- Sent/failed counts, start and completion times, and any error
+- S3 CSV file location (while scheduled)
 - Creation timestamp
 - Total recipient count
 
-**Delete Campaign** (Before Execution):
+**Cancel or Stop Campaign**:
+- **Scheduled**: "🚫 Cancel Campaign" prevents it from running and keeps the record as CANCELLED
+- **Sending**: "⏹️ Stop Sending" discards emails still waiting in the queue (emails already accepted by SES are still delivered)
+
+**Delete Campaign** (any campaign that isn't currently sending):
 1. Select campaign from table
 2. Click "❌ Delete Selected" button
 3. Confirmation dialog explains what will be deleted:
@@ -377,21 +385,18 @@ View and manage scheduled email campaigns awaiting execution.
    - Analytics metadata entry (if deployed)
 4. Confirm (irreversible)
 
-### Automatic Cleanup (TTL)
+### Automatic Cleanup
 
 **Process**:
 1. Campaign executes at scheduled time via EventBridge
-2. 1 hour later: DynamoDB TTL expires campaign record
-3. DynamoDB Stream triggers cleanup Lambda
-4. Cleanup Lambda removes:
-   - EventBridge rule
-   - S3 CSV file
-   - DynamoDB scheduler entry
-5. Analytics data preserved in analytics table
+2. The EventBridge rule is deleted when the campaign starts, and the CSV once every recipient is enqueued
+3. 90 days after the scheduled time, DynamoDB TTL expires the campaign record
+4. Deleting a campaign (or TTL expiry) triggers the cleanup Lambda via DynamoDB Stream, which removes any remaining EventBridge rule and S3 CSV file
 
 **Data Lifecycle**:
-- **Transient** (1 hour after execution): DynamoDB entries, EventBridge rules, S3 CSV files
-- **Permanent**: Campaign analytics, SES event data in S3
+- **Until enqueued**: S3 CSV file (recipient list), EventBridge rule
+- **90 days**: Scheduler DynamoDB entry with status and sent/failed counts
+- **Permanent**: Campaign analytics metadata, SES event data in S3 (per analytics retention)
 
 ---
 
@@ -467,9 +472,9 @@ Configure application behavior, AWS access, and feature settings.
 - Monitor "⚠️ Throttled" counter and adjust if needed
 
 **Scheduled (Cloud Sending)**:
-- SQS queue with Lambda concurrency controls
-- Lambda processes SQS messages in batches
-- Formula: Reserved Concurrency × 20 = Target TPS
+- SQS queue with Lambda trigger maximum concurrency
+- Lambda processes SQS messages in batches of 20
+- Concurrency = `ceil(sendingRateTPS / 20)`, and each invocation paces sends to `sendingRateTPS / concurrency` per second
   - 20 is rough estimate of SendEmail calls per second per concurrent execution
 - Backpressure: If Lambda can't keep up, messages stay in queue
 - No semaphore needed - SQS provides natural buffering

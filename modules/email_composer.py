@@ -6,7 +6,7 @@ Comprehensive email composition interface for single and bulk email sending with
 
 import json
 import asyncio
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from pathlib import Path
 
 from textual.containers import Container, Horizontal, ScrollableContainer
@@ -701,7 +701,7 @@ class EmailComposer:
             validation_result = self.csv_validator.validate_csv_file(
                 csv_path=csv_path,
                 check_duplicates=True,
-                max_rows=50000,
+                max_rows=settings.get('email.max_csv_rows', CSVValidator.MAX_ROWS),
                 template_name=template_name if template_name != Select.BLANK else None
             )
             
@@ -829,21 +829,13 @@ class EmailComposer:
             max_account_rate = 1
             
             try:
-                # Try to get the max rate from cached account details
-                from modules.cache_manager import CacheManager
-                
-                cache_manager = CacheManager(settings)
-                cached_account = cache_manager.get_cached_data("get_account_details")
-                
-                # If no cache exists, fetch fresh account details
-                if not cached_account and self.ses_client:
+                # Try to get the max rate from account details (cached per account/region by the SES client)
+                cached_account = None
+                if self.ses_client:
                     try:
-                        account_response = self.ses_client.ses_client.get_account()
-                        cached_account = account_response
-                        # Cache it for future use
-                        cache_manager.set_cached_data("get_account_details", cached_account)
+                        cached_account = self.ses_client.get_account_details()
                     except Exception:
-                        pass  # nosec B110 - Intentional - widget may not be mounted
+                        pass  # nosec B110 - Intentional - fall back to default rate if account details are unavailable
                 
                 # Extract MaxSendRate from cached or fresh data
                 if cached_account and 'SendQuota' in cached_account:
@@ -1195,7 +1187,23 @@ class EmailComposer:
         default = settings.get('email.default_configuration_set', '')
         if default and default in configuration_sets:
             return default
+        
+        # Fall back to the analytics configuration set so campaigns are tracked by default
+        analytics_config_set = self._get_analytics_config_set()
+        if analytics_config_set and analytics_config_set in configuration_sets:
+            return analytics_config_set
         return ""
+    
+    def _get_analytics_config_set(self) -> Optional[str]:
+        """Configuration set created by the analytics stack, if it is deployed."""
+        manager = getattr(self.app, 'scheduled_campaigns_manager', None)
+        if manager and manager.analytics_deployed and manager.analytics_info:
+            return manager.analytics_info.get('config_set')
+        
+        analytics = getattr(self.app, 'campaign_analytics_manager', None)
+        if analytics and getattr(analytics, 'stack_deployed', False):
+            return analytics.configuration_set_name
+        return None
     
     def _construct_from_email(self) -> str:
         """Construct the from email address."""
@@ -1314,7 +1322,7 @@ class EmailComposer:
             validation_result = self.csv_validator.validate_csv_file(
                 csv_path=csv_path,
                 check_duplicates=True,
-                max_rows=50000,
+                max_rows=settings.get('email.max_csv_rows', CSVValidator.MAX_ROWS),
                 template_name=template_name if template_name != Select.BLANK else None
             )
             
@@ -1369,6 +1377,16 @@ class EmailComposer:
             if config_set and config_set != "" and str(config_set) != "Select.BLANK":
                 final_config_set = config_set
             
+            # Analytics only records events for emails sent with its configuration set
+            analytics_config_set = self._get_analytics_config_set()
+            if analytics_config_set and final_config_set != analytics_config_set:
+                self.app.notify(
+                    f"This campaign won't appear in Campaign Analytics: select the "
+                    f"'{analytics_config_set}' configuration set to track it.",
+                    severity="warning",
+                    timeout=10
+                )
+            
             # Disable send button
             send_btn = self.app.query_one("#send-email-enhanced-btn", Button)
             send_btn.disabled = True
@@ -1392,7 +1410,8 @@ class EmailComposer:
             unsub_type = self.app.query_one("#unsubscribe-type-select", Select).value
             campaign_topic = self.app.query_one("#campaign-topic", Input).value.strip()
             
-            # Schedule the campaign (rate is configured in Lambda concurrency settings)
+            # Schedule the campaign (rate is configured by sendingRateTPS in the stack config)
+            unsubscribe_enabled = unsub_type != "none"
             result = self.app.scheduled_campaigns_manager.schedule_campaign(
                 campaign_name=campaign_name,
                 schedule_datetime=schedule_dt,
@@ -1403,9 +1422,11 @@ class EmailComposer:
                 configuration_set=final_config_set or '',
                 tags=ses_tags,
                 template_data=base_template_data,
-                unsubscribe_enabled=(unsub_type != "none"),
-                unsubscribe_type=unsub_type if unsub_type != "none" else "both",
-                unsubscribe_topic=campaign_topic if campaign_topic else None
+                unsubscribe_enabled=unsubscribe_enabled,
+                unsubscribe_type=unsub_type if unsubscribe_enabled else "both",
+                unsubscribe_topic=campaign_topic if campaign_topic else None,
+                # Lets the stack reject the campaign if its unsubscribe key differs from ours
+                unsubscribe_key_fingerprint=self.unsubscribe_handler.get_key_fingerprint() if unsubscribe_enabled else None
             )
             
             # Write metadata to analytics table if available
@@ -1429,47 +1450,25 @@ class EmailComposer:
             send_btn.label = "📧 Send Email"
             
             if result:
+                # The stack adds campaign_id to every email's tags itself
                 campaign_id = result.get('campaign_id')
                 
-                # NOW update the campaign in DynamoDB to add campaign_id to tags
-                # (campaign_name was already added above)
-                ses_tags['campaign_id'] = campaign_id
-                
-                # Update campaign with complete tags including campaign_id
-                try:
-                    import boto3
-                    from boto3.dynamodb.conditions import Key
-                    
-                    # Get DynamoDB table
-                    if hasattr(self.app.scheduled_campaigns_manager, 'stack_info'):
-                        table_name = self.app.scheduled_campaigns_manager.stack_info.get('table_name')
-                        if table_name:
-                            dynamodb = boto3.resource('dynamodb', region_name=self.app.scheduled_campaigns_manager.region)
-                            table = dynamodb.Table(table_name)
-                            
-                            # Update the campaign record to include campaign_id in tags
-                            table.update_item(
-                                Key={
-                                    'campaign_id': campaign_id,
-                                    'schedule_timestamp': int(schedule_dt.timestamp())
-                                },
-                                UpdateExpression='SET tags = :tags',
-                                ExpressionAttributeValues={':tags': ses_tags}
-                            )
-                except Exception as e:
-                    if get_logger():
-                        get_logger().warning(f"Could not update campaign tags with campaign_id: {str(e)}")
+                if result.get('sent_immediately'):
+                    when_text = "Starting now (scheduled time is less than a minute away)"
+                else:
+                    when_text = f"Scheduled for: {schedule_datetime_str}"
                 
                 self.app.notify(
                     f"✅ Campaign scheduled successfully!\n"
                     f"Campaign ID: {campaign_id}\n"
-                    f"Scheduled for: {schedule_datetime_str}\n"
+                    f"{when_text}\n"
                     f"Recipients: {total_recipients}",
                     severity="success",
                     timeout=10
                 )
             else:
-                self.app.notify("Failed to schedule campaign", severity="error")
+                error = self.app.scheduled_campaigns_manager.last_error or "Unknown error"
+                self.app.notify(f"Failed to schedule campaign: {error}", severity="error", timeout=12)
                 
         except json.JSONDecodeError as e:
             self.app.notify(f"Invalid JSON: {str(e)}", severity="error")

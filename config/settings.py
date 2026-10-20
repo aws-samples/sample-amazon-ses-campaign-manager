@@ -6,16 +6,26 @@ Handles loading and saving application configuration
 
 import json
 import os
+import sys
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 
 
+# Anchor app data folders to the project, not the current working directory
+if getattr(sys, 'frozen', False):
+    # Packaged executable (e.g. PyInstaller): __file__ points inside the bundle, which can be a
+    # temporary folder deleted on exit - keep settings, cache and logs next to the .exe instead
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
 class Settings:
     """Manages application settings with JSON persistence."""
-    
-    def __init__(self, config_dir: str = "config"):
-        self.config_dir = Path(config_dir)
+
+    def __init__(self, config_dir: Optional[str] = None):
+        self.config_dir = Path(config_dir) if config_dir else PROJECT_ROOT / "config"
         self.config_dir.mkdir(exist_ok=True)
         self.settings_file = self.config_dir / "settings.json"
         self._settings = self._load_settings()
@@ -40,7 +50,8 @@ class Settings:
                 "unsubscribe_encryption_key": None,
                 "unsubscribe_base_url": "",
                 "unsubscribe_endpoint_url": "",
-                "unsubscribe_mailto": ""
+                "unsubscribe_mailto": "",
+                "max_csv_rows": 100000
             },
             "ses": {
                 "sending_rate": 1

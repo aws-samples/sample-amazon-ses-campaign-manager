@@ -14,7 +14,7 @@ import json
 
 from modules.logger import get_logger
 from modules.unsubscribe_handler import UnsubscribeHandler
-from config.settings import settings
+from config.settings import settings, PROJECT_ROOT
 
 
 class BulkEmailSender:
@@ -126,7 +126,7 @@ class BulkEmailSender:
         results_filename = f"{csv_file.stem}_results_{timestamp}.csv"
         
         # Save to bulk_email_csv/bulk_email_output/ folder
-        output_dir = Path('bulk_email_csv/bulk_email_output')
+        output_dir = PROJECT_ROOT / 'bulk_email_csv' / 'bulk_email_output'
         output_dir.mkdir(parents=True, exist_ok=True)
         results_path = output_dir / results_filename
         

@@ -4,20 +4,12 @@ Handles unsubscribe link generation and encryption
 Based on ses_tui/modules/unsubscribe_handler.py
 """
 
-import os
 import base64
 from typing import Optional, Dict
+from urllib.parse import quote
 from cryptography.fernet import Fernet
 
-
-def get_env_config() -> Dict[str, str]:
-    """Get unsubscribe configuration from environment variables"""
-    return {
-        'encryption_key': os.environ.get('UNSUBSCRIBE_ENCRYPTION_KEY', ''),
-        'base_url': os.environ.get('UNSUBSCRIBE_BASE_URL', ''),
-        'endpoint_url': os.environ.get('UNSUBSCRIBE_ENDPOINT_URL', ''),
-        'mailto': os.environ.get('UNSUBSCRIBE_MAILTO', '')
-    }
+from unsubscribe_config import get_env_config  # noqa: F401 - re-exported for email_sender
 
 
 def encrypt_email(email: str, encryption_key: str) -> Optional[str]:
@@ -73,7 +65,7 @@ def generate_unsubscribe_link(
     # Construct the unsubscribe URL
     url = f"{base_url}?user={encrypted_email}"
     if topic:
-        url += f"&topic={topic}"
+        url += f"&topic={quote(topic, safe='')}"
     
     return url
 
@@ -115,7 +107,7 @@ def generate_list_unsubscribe_headers(
         # Add HTTPS unsubscribe URL
         url = f"{endpoint_url}?address={encrypted_email}"
         if topic:
-            url += f"&topic={topic}"
+            url += f"&topic={quote(topic, safe='')}"
         unsubscribe_options.append(f"<{url}>")
     
     if mailto:

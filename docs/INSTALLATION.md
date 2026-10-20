@@ -8,6 +8,7 @@ Complete setup instructions, configuration, optional CDK stacks, and troubleshoo
 - [Local Installation](#local-installation)
 - [First Run Configuration](#first-run-configuration)
 - [Optional CDK Stacks](#optional-cdk-stacks)
+- [Upgrading from a Previous Version](#upgrading-from-a-previous-version)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 
@@ -219,6 +220,8 @@ cdk --version
 cdk bootstrap aws://ACCOUNT-ID/REGION
 ```
 
+**Python 3 with pip (or Docker)**: the Scheduled Campaigns stack builds its `cryptography` Lambda layer during `cdk deploy`, using `python3`, `python` or `py` from your PATH and falling back to Docker.
+
 ### Scheduled Campaigns Stack
 
 **Purpose**: Schedule bulk email campaigns for future execution.
@@ -247,6 +250,7 @@ cdk deploy
   "sendingRateTPS": 100,
   "sqsVisibilityTimeout": 300,
   "unsubscribeEncryptionKey": "YOUR_FERNET_KEY_HERE",
+  "unsubscribeEncryptionKeyParameter": "",
   "unsubscribeBaseUrl": "https://example.com",
   "unsubscribeEndpointUrl": "https://api.example.com/unsubscribe",
   "unsubscribeMailto": "unsubscribe@example.com"
@@ -256,11 +260,12 @@ cdk deploy
 **Key Parameters**:
 - `enableNotifications`: Enable SNS notifications for campaign events
 - `notificationEmail`: Email address for notifications
-- `sendingRateTPS`: Target sending rate in emails per second (controls Lambda concurrency)
-  - Formula: `sendingRateTPS ÷ 20 = Lambda Reserved Concurrency`
-  - Example: 100 TPS ÷ 20 = 5 reserved concurrency
-- `sqsVisibilityTimeout`: SQS visibility timeout in seconds (should match Lambda timeout)
-- `unsubscribeEncryptionKey`: Fernet encryption key (copy from TUI settings)
+- `sendingRateTPS`: Maximum sending rate in emails per second, shared by all campaigns (keep at or below your SES max send rate)
+  - Sets the SQS trigger's maximum concurrency to `ceil(sendingRateTPS ÷ 20)`, and each invocation paces its sends
+  - Example: 100 TPS ÷ 20 = 5 concurrent Lambdas
+- `sqsVisibilityTimeout`: Minimum SQS visibility timeout in seconds (the stack raises it to 6x the Email Sender timeout)
+- `unsubscribeEncryptionKey`: Fernet encryption key (copy from TUI settings - must match, or unsubscribe-enabled campaigns are rejected). Don't commit a real key
+- `unsubscribeEncryptionKeyParameter`: Optional SSM SecureString parameter name holding the key, used instead of `unsubscribeEncryptionKey` (see the stack README)
 - `unsubscribeBaseUrl`: Base URL for unsubscribe landing page
 - `unsubscribeEndpointUrl`: API endpoint for one-click unsubscribe
 - `unsubscribeMailto`: Email address for mailto unsubscribe links
@@ -381,6 +386,42 @@ cdk destroy
 
 ---
 
+## Upgrading from a Previous Version
+
+Upgrade in place with `git pull` and `cdk deploy`. **Don't destroy and redeploy**: every stack change is an in-place update, while destroying deletes campaign records and analytics metadata, strands raw event and CSV data in retained S3 buckets, and leaves EventBridge rules for upcoming campaigns pointing at a deleted function.
+
+1. **Pick a quiet time.** Don't upgrade while a scheduled campaign is sending (campaigns scheduled for later are fine and are picked up by the new version).
+
+   Check `SesScheduledCampaignsStack` in the CloudFormation console first. Previous versions referenced a third-party Lambda layer version (`Klayers-p312-cryptography:13`) that has since been deleted, so any update that changed a function's configuration failed and rolled back. A stack in `UPDATE_ROLLBACK_COMPLETE` still works and can be updated normally; older versions of Amazon SES Campaign Manager treated it as not deployed and hid the Scheduled Campaign mode. If it shows `UPDATE_ROLLBACK_FAILED`, choose **Stack actions → Continue update rollback** first. This version builds the layer itself during deploy.
+
+2. **Keep your configuration.** `git pull` refuses to overwrite the `config.json` files you edited, so stash them first:
+   ```bash
+   git stash
+   git pull
+   git stash pop   # resolve any conflicts in config.json, keeping your values
+   ```
+   Existing `config.json` files work unchanged; new fields (`unsubscribeEncryptionKeyParameter`, `sesRefreshLookbackDays`) are optional. Consider setting `firehoseBufferIntervalSeconds` to `60` if it is `0`.
+
+3. **Check the unsubscribe key.** Scheduled campaigns with unsubscribe enabled are now rejected if the stack's key doesn't match `email.unsubscribe_encryption_key` in `config/settings.json` (previously their links silently failed to decrypt). Optionally move the key to SSM Parameter Store - see the [Scheduled Campaigns README](../ses_scheduled_campaigns/README.md).
+
+4. **Deploy both stacks, then start the updated TUI.** The updated TUI relies on the updated scheduled campaigns stack to tag emails with `campaign_id`, so deploy before scheduling campaigns with it:
+   ```bash
+   cd ses_scheduled_campaigns && npm install && cdk deploy && cd ..
+   cd ses_campaign_analytics && npm install && cdk deploy && cd ..
+   pip install -r requirements.txt
+   ```
+
+5. **Rebuild analytics metrics once.** Metrics are now grouped by the day emails were sent. Recompute existing days with the new method (find the function name in the stack's `RefreshLambdaName` output):
+   ```bash
+   aws lambda invoke --function-name <RefreshLambdaName> \
+     --cli-binary-format raw-in-base64-out --payload '{"lookback_days": 90}' response.json
+   ```
+   Raw events older than 30 days were moved to S3 Glacier by previous versions and can't be read by Athena, so days older than that keep their previous values.
+
+6. **Expect alarm emails.** Both stacks now send CloudWatch alarms (failed emails, Lambda errors, Firehose failures) to the existing notification email when notifications are enabled.
+
+---
+
 ## Configuration
 
 ### AWS Configuration
@@ -466,10 +507,10 @@ Settings tab → Cache Management → "Clear All"
 - Next requests fetch fresh from AWS
 
 **Manual Invalidation**:
-Delete specific cache files:
+Cache files are named `<profile>_<region>__<operation>.json`, so each AWS profile and region has its own cached data. Delete specific cache files:
 ```bash
-rm cache/get_templates.json
-rm cache/get_identities.json
+rm cache/*__get_templates.json
+rm cache/*__get_identities.json
 # etc.
 ```
 
@@ -524,7 +565,7 @@ aws ses get-account --profile your-profile
 **Solution**:
 1. Verify templates exist in AWS Console → SES → Email Templates
 2. Check correct region selected in Settings
-3. Clear template cache: `rm cache/get_templates.json`
+3. Clear template cache: `rm cache/*__get_templates.json`
 4. Refresh Templates tab
 
 #### Bulk sending throttled

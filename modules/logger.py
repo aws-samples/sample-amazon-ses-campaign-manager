@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from config.settings import PROJECT_ROOT
+
 
 class Logger:
     """Centralized logger that handles both console and file logging based on debug settings."""
@@ -15,7 +17,7 @@ class Logger:
     def __init__(self, settings):
         self.settings = settings
         # Use logs directory
-        self.logs_dir = Path("logs")
+        self.logs_dir = PROJECT_ROOT / "logs"
         self.logs_dir.mkdir(exist_ok=True)
         self.log_file_path = self.logs_dir / "debug.log"
         self._ensure_log_file()
