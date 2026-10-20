@@ -28,15 +28,15 @@ Amazon SES Campaign Manager → S3 (CSV) → DynamoDB → EventBridge (Schedule)
 
 ### Key Components
 
-1. **S3 Bucket** - Stores CSV files with recipient data
-2. **DynamoDB Table** - Campaign metadata and status tracking
-3. **EventBridge Scheduler** - Triggers campaigns at scheduled time
-4. **SQS FIFO Queue** - Buffers email messages for rate-limited processing
+1. **S3 Bucket** - Stores CSV files with recipient data (deleted once a campaign is enqueued)
+2. **DynamoDB Table** - Campaign metadata, status and sent/failed counts (kept 90 days)
+3. **EventBridge Rules** - One-time rule per campaign triggers it at the scheduled time
+4. **SQS Standard Queue** - Buffers email messages for rate-limited processing, with a dead-letter queue
 5. **Lambda: Campaign Processor** - Reads CSV, enqueues messages to SQS
 6. **Lambda: Email Sender** - Processes batches of 20 emails, sends via SES
-7. **Lambda: TTL Cleanup** - Removes EventBridge rules and S3 files after execution
+7. **Lambda: TTL Cleanup** - Removes EventBridge rules and S3 files when a campaign record is deleted
 
-### Rate Limiting (AWS Best Practice)
+### Rate Limiting
 
 Based on [AWS Load Testing Sample](https://github.com/aws-samples/load-testing-sample-amazon-ses):
 
@@ -45,27 +45,46 @@ Based on [AWS Load Testing Sample](https://github.com/aws-samples/load-testing-s
 - One Lambda can process ~20 emails/second
 - Batch processing reduces Lambda invocations by 20x
 
-**Formula:** `Target TPS = Reserved Concurrency × 20 emails/sec`
+**How `sendingRateTPS` is enforced:**
+- The SQS trigger's **maximum concurrency** is `ceil(TPS / 20)` (minimum 2, maximum 1000)
+- Each invocation **paces its sends** to `TPS / concurrency` emails per second
+- Total rate never exceeds `sendingRateTPS`, even when SES responds faster than 50ms
 
 **Examples:**
-- 100 TPS: 5-7 concurrent Lambdas
-- 1000 TPS: 50-70 concurrent Lambdas
-- 2000 TPS: 100-140 concurrent Lambdas
+- 10 TPS: 2 concurrent Lambdas, each sending 5 emails/second
+- 100 TPS: 5 concurrent Lambdas, each sending 20 emails/second
+- 1000 TPS: 50 concurrent Lambdas, each sending 20 emails/second
 
-**Note:** Add ~40% buffer for Lambda-SQS scaling overhead.
+**Note:** Set `sendingRateTPS` at or below your SES account's maximum send rate (SES console → Account dashboard). Reserved concurrency is not used: it throttles the SQS trigger, which pushes unsent messages to the dead-letter queue.
 
 ### Error Handling
 
-- **Transient errors** (throttling): Message requeued to SQS automatically
-- **Permanent errors** (invalid email): Sent to DLQ after 3 attempts
-- **Partial batch failures**: Only failed messages requeue, not entire batch
+- **Throttling** (maximum send rate exceeded): Requeued with exponential backoff (up to 15 minutes), dead-lettered after 10 throttles
+- **Daily sending quota exceeded**: Dead-lettered immediately (retrying for hours won't help)
+- **Permanent errors** (rejected message, missing template, paused sending, invalid parameters): Dead-lettered immediately
+- **Unknown errors**: Retried by SQS up to 5 times, then dead-lettered
+- **Partial batch failures**: Only failed messages are retried, not the entire batch
+- Every dead-lettered email counts toward the campaign's `failed_count` and includes the error in its message body, so campaigns always reach COMPLETED
 
-### Automatic Cleanup (TTL)
+### Campaign Statuses
 
-- **1 hour after execution**: DynamoDB TTL expires campaign record
-- **DynamoDB Stream**: Triggers cleanup Lambda
-- **Cleanup actions**: Removes EventBridge rule + deletes S3 CSV file
-- **Analytics preserved**: Campaign data retained in separate analytics table
+| Status | Meaning |
+|--------|---------|
+| `SCHEDULED` | Waiting for its scheduled time |
+| `PROCESSING` | Recipients are being enqueued and sent |
+| `COMPLETED` | Every recipient was sent or failed |
+| `FAILED` | The campaign could not be processed (see `error_message`) |
+| `CANCELLED` | Cancelled before it started |
+| `STOPPED` | Stopped while sending; queued emails were discarded |
+
+If the scheduled time is less than a minute away (or up to 5 minutes in the past, e.g. after a slow CSV upload), the campaign starts immediately instead of waiting for an EventBridge rule that would never fire.
+
+### Retention and Cleanup
+
+- **Campaign records**: Kept for 90 days after the scheduled time (DynamoDB TTL), so status and sent/failed counts stay available in Amazon SES Campaign Manager
+- **CSV files**: Deleted as soon as every recipient is enqueued; old object versions are purged after 1 day
+- **EventBridge rules**: Deleted when the campaign starts or is cancelled
+- **Deleting a campaign** in Amazon SES Campaign Manager: DynamoDB Stream triggers the cleanup Lambda, which removes its EventBridge rule and CSV file
 
 ## Installation & Configuration
 
@@ -83,6 +102,7 @@ Edit `config.json`:
   "sendingRateTPS": 100,
   "sqsVisibilityTimeout": 300,
   "unsubscribeEncryptionKey": "",
+  "unsubscribeEncryptionKeyParameter": "",
   "unsubscribeBaseUrl": "",
   "unsubscribeEndpointUrl": "",
   "unsubscribeMailto": ""
@@ -93,16 +113,25 @@ Edit `config.json`:
 
 - `enableNotifications` (true/false): Enable SNS email notifications for campaign events
 - `notificationEmail`: Email address to receive campaign notifications (required if notifications enabled)
-- `sendingRateTPS` (1-14000): Target sending rate in emails per second. CDK auto-calculates Lambda concurrency: `ceil(TPS / 20)`
+- `sendingRateTPS` (1-14000): Maximum sending rate in emails per second, shared by all campaigns. CDK sets the SQS trigger's maximum concurrency to `ceil(TPS / 20)` and paces each invocation (see [Rate Limiting](#rate-limiting))
   - Examples: 100 TPS = 5 concurrent Lambdas, 1000 TPS = 50 concurrent Lambdas
-- `sqsVisibilityTimeout` (300): Seconds a message is hidden after being picked up by Lambda (5 minutes recommended)
-  - If Lambda doesn't finish within this time, message becomes visible again for retry
-- `unsubscribeEncryptionKey`: Fernet encryption key from Amazon SES Campaign Manager `config/settings.json` (leave empty if not using unsubscribe)
+- `sqsVisibilityTimeout` (300): Minimum seconds a message is hidden after being picked up by Lambda. The stack raises it to at least 6x the Email Sender timeout, as AWS recommends for Lambda triggers
+- `unsubscribeEncryptionKey`: Fernet encryption key from Amazon SES Campaign Manager `config/settings.json` (leave empty if not using unsubscribe). Don't commit a real key - prefer `unsubscribeEncryptionKeyParameter`
+- `unsubscribeEncryptionKeyParameter`: Name of an SSM Parameter Store **SecureString** holding the Fernet key. When set, it is used instead of `unsubscribeEncryptionKey` and the key is not stored in Lambda environment variables (uses the default `aws/ssm` KMS key)
 - `unsubscribeBaseUrl`: Landing page URL from Amazon SES Campaign Manager settings (leave empty if not using unsubscribe)
 - `unsubscribeEndpointUrl`: API endpoint URL from Amazon SES Campaign Manager settings (leave empty if not using unsubscribe)
 - `unsubscribeMailto`: Mailto address from Amazon SES Campaign Manager settings (leave empty if not using unsubscribe)
 
-**Note:** Unsubscribe fields should match your Amazon SES Campaign Manager `config/settings.json` if you're using unsubscribe features. Keep them in sync between both configurations.
+**Note:** Unsubscribe fields must match your Amazon SES Campaign Manager `config/settings.json`. If the encryption key differs, the stack rejects the campaign when you schedule it (your unsubscribe endpoint couldn't decrypt the links). The stack also rejects unsubscribe-enabled campaigns when the URLs needed for the selected unsubscribe type aren't configured.
+
+To store the key in SSM instead of `config.json`:
+
+```bash
+aws ssm put-parameter --name /ses-campaigns/unsubscribe-key --type SecureString \
+  --value "$(python3 -c "import json; print(json.load(open('../config/settings.json'))['email']['unsubscribe_encryption_key'])")"
+```
+
+Then set `"unsubscribeEncryptionKeyParameter": "/ses-campaigns/unsubscribe-key"` and leave `unsubscribeEncryptionKey` empty.
 
 ## Deployment
 
@@ -127,17 +156,17 @@ cdk deploy
 ### 2. Campaign Execution
 
 1. EventBridge triggers Campaign Processor Lambda at scheduled time
-2. Lambda updates status to PROCESSING
-3. Lambda reads CSV from S3, creates individual SQS messages
-4. Email Sender Lambdas process queue (rate-limited by concurrency)
+2. Lambda claims the campaign (SCHEDULED → PROCESSING) in a single conditional write, so duplicate triggers can't send it twice
+3. Lambda reads CSV from S3, creates individual SQS messages, and saves progress every 100 recipients (if it runs out of time, the retry resumes where it stopped)
+4. Email Sender Lambdas process queue (rate-limited by `sendingRateTPS`)
 5. Each Lambda processes batches of 20 emails
-6. Campaign status updated to COMPLETED when done
+6. Campaign status updated to COMPLETED once every recipient was sent or failed
 
 ### 3. Monitoring & Management
 
-- View scheduled campaigns in Amazon SES Campaign Manager
-- Delete campaigns before execution
-- Monitor progress in DynamoDB
+- View campaigns of every status, with sent/failed progress, in Amazon SES Campaign Manager
+- Cancel a scheduled campaign, or stop one that is sending
+- Delete campaigns that aren't currently sending
 - Check CloudWatch logs for details
 
 ### CSV Format
@@ -155,27 +184,21 @@ jane@example.com,Jane,Tech Inc
 
 ## Adjusting Sending Rate
 
-The sending rate is configured in Lambda concurrency, not per-campaign.
-
-### Via AWS Console
-
-1. Go to AWS Lambda Console
-2. Find function: `SesScheduledCampaignsStack-EmailSender...`
-3. Go to **Configuration** → **Concurrency**
-4. Set **Reserved concurrent executions**
-
-**Formula:** `Reserved Concurrency × 20 = Target TPS`
-
-### Via AWS CLI
+The sending rate applies to all campaigns. Change `sendingRateTPS` in `config.json` and redeploy:
 
 ```bash
-# Set to 100 TPS (5 concurrent executions)
-aws lambda put-function-concurrency \
-  --function-name SesScheduledCampaignsStack-EmailSender... \
-  --reserved-concurrent-executions 5
+cdk deploy
 ```
 
 ## Monitoring
+
+### CloudWatch Alarms
+
+Sent to the notification email when `enableNotifications` is true:
+
+- **EmailDlqAlarm**: Emails failed permanently - inspect the dead-letter queue (`EmailDLQUrl` output); each message includes `error_message`
+- **CampaignProcessorErrorsAlarm**: A campaign could not be processed
+- **EmailSenderErrorsAlarm**: Email Sender invocations are failing
 
 ### CloudWatch Metrics
 
@@ -185,7 +208,13 @@ aws lambda put-function-concurrency \
 - **DLQ Messages**: Permanent failures
 - **Campaign Progress**: In DynamoDB
 
+### Upgrading
+
+Upgrade in place with `git pull` and `cdk deploy` - don't destroy and redeploy. Deploy when no campaign is currently sending: messages queued by the previous version keep sending, but campaigns that were mid-send may not be marked COMPLETED. See [Upgrading from a Previous Version](../docs/INSTALLATION.md#upgrading-from-a-previous-version) for the full steps.
+
 ## Cost Example
+
+Amazon SES Campaign Manager accepts CSV files of up to 50,000 recipients; larger campaigns can be scheduled by calling the `CampaignScheduler` Lambda directly.
 
 **1 Million emails @ 100 TPS:**
 - Lambda invocations: 50,000 (20 emails each)
@@ -201,8 +230,8 @@ aws lambda put-function-concurrency \
 
 Works seamlessly with [Campaign Analytics Stack](../ses_campaign_analytics/):
 
-1. Use the same SES `configuration_set` in both stacks
-2. Set appropriate `campaign_id` and `campaign_name` tags
+1. Select the analytics configuration set (`ses-analytics-<account>`) when scheduling - Amazon SES Campaign Manager selects it by default and warns if it isn't selected
+2. `campaign_id` and `campaign_name` tags are added to every email automatically
 3. Events automatically flow: SES → Kinesis Firehose → S3 → Athena
 4. Query campaign metrics in analytics stack
 

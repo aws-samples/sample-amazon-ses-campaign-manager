@@ -103,11 +103,11 @@ The diagram above shows how the three components work together:
 **Scheduled Campaigns** (Deploy [ses-scheduled-campaigns](./ses_scheduled_campaigns/README.md) stack)
 - Schedule bulk CSV campaigns for future execution (days/weeks in advance)
 - **Rate limiting**: SQS queue with backpressure mechanism
-- **Retry logic**: Transient errors (e.g., throttling) written back to SQS, permanent errors to DLQ
-- **Sending mechanism**: SQS batching + Lambda concurrency for maximum TPS without exceeding quota
+- **Retry logic**: Throttled emails requeued with backoff, permanent errors to DLQ (counted as failed)
+- **Sending mechanism**: SQS batching + Lambda trigger concurrency and pacing, capped at your configured TPS
 - No need to keep TUI running - execution happens in AWS Lambda
-- View and delete upcoming scheduled campaigns
-- Automatic cleanup of CSV and EventBridge Rule 1 hour after execution (TTL-based)
+- View campaigns and their progress, cancel scheduled ones, stop ones that are sending
+- CSV deleted once enqueued; campaign records kept for 90 days
 
 **Campaign Analytics** (Deploy [ses-campaign-analytics](./ses_campaign_analytics/README.md) stack)
 - Detailed performance tracking with Kinesis Firehose + Athena
@@ -133,11 +133,11 @@ Your Machine → AWS CLI Credentials → Amazon SES API
 
 **Rate Limiting**
 - **Local (Immediate)**: Semaphore-based concurrent task limiting. Set to 85-90% of AWS MaxSendRate to account for async efficiency (~10-15% boost in actual TPS)
-- **Scheduled (Cloud)**: SQS queue with Lambda concurrency controls. Backpressure mechanism prevents overwhelming SES. Formula: Reserved Concurrency × 20 = Target TPS. 20 is a rough estimate of number of SendEmail SES API calls can be done in 1 second.
+- **Scheduled (Cloud)**: SQS queue with Lambda trigger maximum concurrency of `ceil(TPS / 20)`, and each invocation paces its sends so the total stays at `sendingRateTPS`. Backpressure mechanism prevents overwhelming SES. 20 is a rough estimate of number of SendEmail SES API calls can be done in 1 second.
 
 **Retry Logic**
 - **Local (Immediate)**: Exponential backoff with configurable max retries (0-10) and base delay (0.1-10s). Throttling errors use 2× base delay
-- **Scheduled (Cloud)**: Transient errors (throttling, service unavailable) written back to SQS for retry. Permanent errors sent to DLQ. Uses SQS batching and Lambda concurrency for optimal throughput
+- **Scheduled (Cloud)**: Throttled emails written back to SQS with exponential backoff; other transient errors retried by SQS (only the failed messages in a batch). Permanent errors sent to DLQ and counted as failed. Uses SQS batching and Lambda concurrency for optimal throughput
 
 **Progress Tracking**
 - **Local (Immediate) only**: Real-time progress bar, pause/resume/cancel controls, live statistics (success/fail/throttled counts)

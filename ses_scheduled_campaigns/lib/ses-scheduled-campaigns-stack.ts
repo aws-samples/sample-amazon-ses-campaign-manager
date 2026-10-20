@@ -10,6 +10,9 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { NagSuppressions } from 'cdk-nag';
 import * as path from 'path';
 
@@ -28,6 +31,7 @@ export interface SesScheduledCampaignsStackProps extends cdk.StackProps {
   dlqMessageRetention: number;
   enablePointInTimeRecovery: boolean;
   unsubscribeEncryptionKey: string;
+  unsubscribeEncryptionKeyParameter?: string;
   unsubscribeBaseUrl: string;
   unsubscribeEndpointUrl: string;
   unsubscribeMailto: string;
@@ -68,6 +72,19 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
           ],
           expiration: Duration.days(props.csvRetentionDays),
         },
+        {
+          // Bucket is versioned, so deletes only add a delete marker - purge the
+          // old version too, otherwise recipient lists (PII) are kept forever
+          id: 'PurgeDeletedCsvVersions',
+          enabled: true,
+          noncurrentVersionExpiration: Duration.days(1),
+          abortIncompleteMultipartUploadAfter: Duration.days(1),
+        },
+        {
+          id: 'RemoveExpiredDeleteMarkers',
+          enabled: true,
+          expiredObjectDeleteMarker: true,
+        },
       ],
     });
 
@@ -92,6 +109,21 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    //////// EMAIL SENDER SIZING ////////
+
+    // Concurrency is enforced by the SQS event source (maxConcurrency) rather than
+    // reserved concurrency: reserved concurrency throttles the SQS poller, which
+    // pushes never-attempted messages to the DLQ. Each invocation also paces its
+    // sends so the total stays at sendingRateTPS even when SES responds quickly.
+    const targetTPS = props.sendingRateTPS || 1;
+    const senderConcurrency = Math.min(1000, Math.max(2, Math.ceil(targetTPS / 20))); // Event source allows 2-1000
+    const perInvocationRate = targetTPS / senderConcurrency;
+    const senderBatchSize = 20;
+    // Long enough to send a full batch at the paced rate, with headroom for SES latency
+    const senderTimeoutSeconds = Math.max(60, Math.ceil(senderBatchSize / perInvocationRate) + 30);
+    // AWS guidance: visibility timeout at least 6x the function timeout
+    const queueVisibilityTimeout = Math.max(props.sqsVisibilityTimeout, senderTimeoutSeconds * 6);
+
     //////// SQS QUEUES FOR EMAIL PROCESSING ////////
 
     // Dead Letter Queue
@@ -105,7 +137,7 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
     this.emailQueue = new sqs.Queue(this, 'EmailQueue', {
       queueName: `ses-scheduled-campaigns-queue-${cdk.Stack.of(this).account}`,
       encryption: sqs.QueueEncryption.SQS_MANAGED,
-      visibilityTimeout: Duration.seconds(props.sqsVisibilityTimeout),
+      visibilityTimeout: Duration.seconds(queueVisibilityTimeout),
       retentionPeriod: Duration.seconds(props.sqsMessageRetention),
       deadLetterQueue: {
         queue: emailDlq,
@@ -153,33 +185,40 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
     // Lambda code without dependencies
     const lambdaCode = lambda.Code.fromAsset(path.join(__dirname, '../lambda'));
     
+    // Unsubscribe key: SSM SecureString if configured, otherwise the plain config value
+    const unsubscribeKeyParameter = props.unsubscribeEncryptionKeyParameter
+      ? ssm.StringParameter.fromSecureStringParameterAttributes(this, 'UnsubscribeKeyParameter', {
+          parameterName: props.unsubscribeEncryptionKeyParameter,
+        })
+      : undefined;
+
+    const unsubscribeEnvironment = {
+      UNSUBSCRIBE_ENCRYPTION_KEY: unsubscribeKeyParameter ? '' : (props.unsubscribeEncryptionKey || ''),
+      UNSUBSCRIBE_ENCRYPTION_KEY_PARAM: props.unsubscribeEncryptionKeyParameter || '',
+      UNSUBSCRIBE_BASE_URL: props.unsubscribeBaseUrl || '',
+      UNSUBSCRIBE_ENDPOINT_URL: props.unsubscribeEndpointUrl || '',
+      UNSUBSCRIBE_MAILTO: props.unsubscribeMailto || '',
+    };
+
     // Note: EmailSender function must be created before CampaignProcessor
     // so we can reference its name in the environment variable
-    
-    // Calculate Lambda concurrency from desired TPS
-    // Formula: Concurrency = ceil(TPS / 20)
-    // Each Lambda processes 20 emails, so TPS/20 = required concurrent executions
-    const targetTPS = props.sendingRateTPS || 1;
-    const calculatedConcurrency = Math.max(1, Math.ceil(targetTPS / 20)); // Minimum 1, no decimals
-    
+
     this.emailSenderFunction = new lambda.Function(this, 'EmailSender', {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'email_sender.handler',
       code: lambdaCode,
       layers: [cryptographyLayer],
-      timeout: Duration.minutes(5),
+      timeout: Duration.seconds(senderTimeoutSeconds),
       memorySize: props.emailSenderMemory,
       logRetention: logs.RetentionDays.ONE_WEEK,
-      reservedConcurrentExecutions: calculatedConcurrency, // Auto-calculated from config (min 1)
       environment: {
         CAMPAIGN_TABLE_NAME: this.campaignTable.tableName,
         EMAIL_QUEUE_URL: this.emailQueue.queueUrl,
         DLQ_QUEUE_URL: emailDlq.queueUrl,
         NOTIFICATION_TOPIC_ARN: notificationTopic?.topicArn || '',
-        UNSUBSCRIBE_ENCRYPTION_KEY: props.unsubscribeEncryptionKey || '',
-        UNSUBSCRIBE_BASE_URL: props.unsubscribeBaseUrl || '',
-        UNSUBSCRIBE_ENDPOINT_URL: props.unsubscribeEndpointUrl || '',
-        UNSUBSCRIBE_MAILTO: props.unsubscribeMailto || '',
+        MAX_RECEIVE_COUNT: String(props.sqsMaxReceiveCount),
+        MAX_SEND_RATE_PER_INVOCATION: perInvocationRate.toFixed(3),
+        ...unsubscribeEnvironment,
       },
     });
 
@@ -197,10 +236,8 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
         EMAIL_QUEUE_URL: this.emailQueue.queueUrl,
         NOTIFICATION_TOPIC_ARN: notificationTopic?.topicArn || '',
         EMAIL_SENDER_FUNCTION_NAME: this.emailSenderFunction.functionName,
-        UNSUBSCRIBE_ENCRYPTION_KEY: props.unsubscribeEncryptionKey || '',
-        UNSUBSCRIBE_BASE_URL: props.unsubscribeBaseUrl || '',
-        UNSUBSCRIBE_ENDPOINT_URL: props.unsubscribeEndpointUrl || '',
-        UNSUBSCRIBE_MAILTO: props.unsubscribeMailto || '',
+        CAMPAIGN_RETENTION_DAYS: String(props.campaignRetentionDays),
+        ...unsubscribeEnvironment,
       },
     });
 
@@ -214,7 +251,7 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
     
     this.campaignProcessorFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['s3:GetObject'],
+        actions: ['s3:GetObject', 's3:DeleteObject'],
         resources: [`${this.campaignBucket.bucketArn}/*`],
       }),
     );
@@ -265,7 +302,7 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
     // Grant specific permissions to Email Sender (least privilege)
     this.emailSenderFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['dynamodb:Query', 'dynamodb:UpdateItem'],
+        actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
         resources: [this.campaignTable.tableArn],
       }),
     );
@@ -274,10 +311,11 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
       notificationTopic.grantPublish(this.emailSenderFunction);
     }
 
-    // Grant SQS permissions for manual message handling
+    // Requeue throttled messages with a delay and dead-letter failed ones
+    // (receive/delete permissions are granted by the SQS event source)
     this.emailSenderFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['sqs:DeleteMessage', 'sqs:SendMessage', 'sqs:ReceiveMessage'],
+        actions: ['sqs:SendMessage'],
         resources: [this.emailQueue.queueArn, emailDlq.queueArn],
       }),
     );
@@ -308,11 +346,13 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
 
     // Add SQS trigger to Email Sender
     // Batch size of 20 means Lambda processes up to 20 emails per invocation
-    // Manual message handling - no automatic DLQ or batch failures
+    // Partial batch responses: only messages the handler reports as failed are retried
     this.emailSenderFunction.addEventSource(
       new lambdaEventSources.SqsEventSource(this.emailQueue, {
-        batchSize: 20, // Process 20 messages per Lambda invocation
+        batchSize: senderBatchSize, // Process 20 messages per Lambda invocation
         maxBatchingWindow: Duration.seconds(1), // Required to be > 0 when batch size > 10
+        maxConcurrency: senderConcurrency,
+        reportBatchItemFailures: true,
       }),
     );
 
@@ -329,6 +369,8 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
         CAMPAIGN_TABLE_NAME: this.campaignTable.tableName,
         CAMPAIGN_BUCKET_NAME: this.campaignBucket.bucketName,
         CAMPAIGN_PROCESSOR_ARN: this.campaignProcessorFunction.functionArn,
+        CAMPAIGN_RETENTION_DAYS: String(props.campaignRetentionDays),
+        ...unsubscribeEnvironment,
       },
     });
 
@@ -347,13 +389,15 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
       }),
     );
 
-    // Grant permission to create EventBridge rules
+    // Grant permission to create EventBridge rules (and delete them on cancel / failed scheduling)
     campaignSchedulerFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: [
           'events:PutRule',
           'events:PutTargets',
           'events:DescribeRule',
+          'events:RemoveTargets',
+          'events:DeleteRule',
         ],
         resources: [
           `arn:aws:events:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:rule/ses-campaign-*`,
@@ -371,6 +415,12 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
 
     // Grant permission to invoke campaign processor
     this.campaignProcessorFunction.grantInvoke(campaignSchedulerFunction);
+
+    if (unsubscribeKeyParameter) {
+      unsubscribeKeyParameter.grantRead(this.campaignProcessorFunction);
+      unsubscribeKeyParameter.grantRead(this.emailSenderFunction);
+      unsubscribeKeyParameter.grantRead(campaignSchedulerFunction);
+    }
 
     NagSuppressions.addResourceSuppressions(
       campaignSchedulerFunction,
@@ -426,6 +476,10 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
         batchSize: 10,
         bisectBatchOnError: true,
         retryAttempts: 2,
+        // Only deletions - progress counter updates would otherwise invoke this per batch sent
+        filters: [
+          lambda.FilterCriteria.filter({ eventName: lambda.FilterRule.isEqual('REMOVE') }),
+        ],
       }),
     );
 
@@ -442,6 +496,53 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
       ],
       true,
     );
+
+    //////// ALARMS ////////
+
+    const alarms = [
+      new cloudwatch.Alarm(this, 'EmailDlqAlarm', {
+        alarmDescription: 'Emails failed permanently and are in the dead-letter queue (each message includes its error)',
+        metric: emailDlq.metricApproximateNumberOfMessagesVisible({ period: Duration.minutes(5) }),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'CampaignProcessorErrorsAlarm', {
+        alarmDescription: 'Campaign Processor failed - a scheduled campaign may not have been enqueued',
+        metric: this.campaignProcessorFunction.metricErrors({ period: Duration.minutes(5) }),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'EmailSenderErrorsAlarm', {
+        alarmDescription: 'Email Sender invocations are failing',
+        metric: this.emailSenderFunction.metricErrors({ period: Duration.minutes(5) }),
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ];
+
+    if (notificationTopic) {
+      // The topic policy replaces SNS's default policy, so CloudWatch needs an explicit allow
+      notificationTopic.addToResourcePolicy(
+        new iam.PolicyStatement({
+          actions: ['sns:Publish'],
+          resources: [notificationTopic.topicArn],
+          principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
+          conditions: {
+            ArnLike: { 'aws:SourceArn': `arn:aws:cloudwatch:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:alarm:*` },
+          },
+        }),
+      );
+
+      for (const alarm of alarms) {
+        alarm.addAlarmAction(new cloudwatchActions.SnsAction(notificationTopic));
+      }
+    }
 
     //////// OUTPUTS ////////
 
@@ -482,6 +583,11 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
         description: 'SNS topic for campaign notifications',
       });
     }
+
+    new CfnOutput(this, 'EmailDLQUrl', {
+      value: emailDlq.queueUrl,
+      description: 'Dead-letter queue for emails that failed permanently',
+    });
 
     new CfnOutput(this, 'DeploymentRegion', {
       value: cdk.Stack.of(this).region,

@@ -31,17 +31,17 @@ SES Events → Kinesis Firehose → S3 (Parquet) → Glue → Athena
 
 1. **Kinesis Data Firehose** - Ingests SES events, converts to Parquet
 2. **S3 Data Lake** - Stores raw events (partitioned) and materialized views
-3. **Partition Lambda** - Auto-adds partitions when data arrives
+3. **Partition Lambda** - Registers raw event partitions in Glue when data arrives
 4. **DynamoDB** - Stores campaign metadata (template, creator, description)
 5. **Glue Database** - Catalog for Athena queries
-6. **Materialized View Lambda** - Daily aggregation (2 AM UTC)
+6. **Materialized View Lambda** - Nightly aggregation (2 AM UTC) of the last 14 send dates
 7. **Athena** - Query engine with 7-day result caching
 
 ### Cost Optimization
 
 - **Materialized Views**: Pre-aggregated daily metrics reduce query costs by 95%+
 - **Parquet Format**: Columnar storage with Snappy compression
-- **Partition Projection**: No manual partition management
+- **Automatic Partitions**: Raw events are registered on arrival; metrics use partition projection
 - **Query Result Caching**: 7-day cache for identical queries
 
 ## Installation & Configuration
@@ -55,18 +55,23 @@ Edit `config.json`:
 
 ```json
 {
-  "sesConfigurationSetName": "ses-campaign-analytics",
+  "sesExistingConfigurationSetName": "",
   "sesRefreshScheduleCron": "cron(0 2 * * ? *)",
+  "sesRefreshLookbackDays": 14,
   "sesDataRetentionDays": 90,
   "sesEnableNotifications": true,
-  "sesNotificationEmail": "your-email@example.com"
+  "sesNotificationEmail": "your-email@example.com",
+  "firehoseBufferIntervalSeconds": 60
 }
 ```
 
 **Key Settings:**
-- `sesConfigurationSetName`: Name for SES configuration set (auto-created)
+- `sesExistingConfigurationSetName`: Use an existing SES configuration set (leave empty to create `ses-analytics-<account>`)
 - `sesRefreshScheduleCron`: Schedule for materialized view refresh (default: 2 AM UTC)
-- `sesNotificationEmail`: Email for SNS notifications
+- `sesRefreshLookbackDays` (1-90): Send dates recomputed on each refresh (default 14). Opens, clicks, bounces and complaints that arrive later than this after the send aren't counted
+- `sesDataRetentionDays`: Days to keep raw events in S3
+- `sesNotificationEmail`: Email for SNS notifications and alarms
+- `firehoseBufferIntervalSeconds` (0-900): How long Firehose buffers events before writing a file. Lower values mean more, smaller files (more S3 requests and partition Lambda invocations); 60 is a good balance for same-day analytics
 
 ## Deployment
 
@@ -88,9 +93,13 @@ cdk deploy
 
 Amazon SES Campaign Manager automatically detects the deployed stack via CloudFormation outputs and configures itself.
 
+### Configuration Set (Required)
+
+SES only publishes events for emails sent with the analytics configuration set (the `SesConfigurationSetName` output). Amazon SES Campaign Manager selects it by default and warns when you schedule a campaign without it.
+
 ### Campaign Tagging (Required)
 
-Both tags are **required** for proper tracking:
+Both tags are **required** for proper tracking (Amazon SES Campaign Manager and the scheduled campaigns stack add them automatically):
 - `campaign_id`: Unique identifier (auto-generated: `timestamp-random`)
 - `campaign_name`: Human-readable name (can be reused)
 
@@ -111,11 +120,18 @@ When sending emails via Amazon SES Campaign Manager, metadata is automatically s
 - **Manual Refresh**: Trigger materialized view refresh for same-day analytics
 - **Campaign Search**: Filter by campaign name
 
+### How Metrics Are Calculated
+
+- Every event is attributed to the day its email was **sent** (`mail.timestamp`), not the day the event arrived. An open two days after the send counts toward the send day, and each email is counted once, so summing days never double-counts
+- `date` in `campaign_metrics_daily` is the send date
+- Each refresh recomputes the last `sesRefreshLookbackDays` send dates, so late events are picked up and a failed night is filled in automatically
+- Overlapping refreshes (nightly run plus a manual one) are serialized with a lock, so results are never double-counted
+
 ### Automatic Partition Management
 
 When Firehose delivers files to S3, a Lambda function automatically:
 - Parses S3 key structure (year/month/day/hour)
-- Registers partition with Athena
+- Registers the partition through the Glue API (failures raise, are retried, and trigger the `PartitionErrorsAlarm`)
 - Makes data queryable within seconds
 
 **Benefits:**
@@ -129,34 +145,55 @@ When Firehose delivers files to S3, a Lambda function automatically:
 
 After sending emails:
 1. Events arrive in Firehose within seconds
-2. Firehose buffers (configurable: 0-300 seconds)
+2. Firehose buffers (`firehoseBufferIntervalSeconds`, default 60 seconds)
 3. Data lands in S3 as Parquet
 4. Query immediately with Athena
 
 ### Query Raw Events
 
+Replace `<account>` with your AWS account ID (the database name is the `GlueDatabaseName` stack output).
+
 ```sql
-SELECT * FROM ses_campaign_analytics_db.ses_events
-WHERE year = 2025 AND month = 1 AND day = 11
+SELECT * FROM ses_analytics_db_<account>.ses_events_raw
+WHERE ingest_timestamp >= TIMESTAMP '2025-01-11 00:00:00'
+  AND ingest_timestamp < TIMESTAMP '2025-01-12 00:00:00'
 LIMIT 10;
 ```
 
 ### Query Materialized Views (Recommended)
 
 ```sql
-SELECT * FROM ses_campaign_analytics_db.campaign_metrics_daily
+SELECT * FROM ses_analytics_db_<account>.campaign_metrics_daily
 WHERE campaign_name = 'newsletter-2025'
 ORDER BY date DESC;
 ```
 
 ### Query Campaign Summary
 
+Both views in [sql/](sql/) are created automatically on deploy.
+
 ```sql
-SELECT * FROM ses_campaign_analytics_db.campaign_summary
+SELECT * FROM ses_analytics_db_<account>.campaign_summary
 ORDER BY total_sent DESC;
 ```
 
+### Query Today's Activity (Before the Nightly Refresh)
+
+```sql
+SELECT * FROM ses_analytics_db_<account>.campaign_status_realtime
+ORDER BY emails_sent DESC;
+```
+
 ## Monitoring
+
+### CloudWatch Alarms
+
+Sent to the notification email when notifications are enabled:
+
+- **RefreshErrorsAlarm**: Materialized view refresh failed
+- **PartitionErrorsAlarm**: Raw event partitions could not be registered
+- **FirehoseConversionFailuresAlarm**: Events failed Parquet conversion (written to the `errors/` prefix)
+- **FirehoseDeliveryFailuresAlarm**: Firehose could not deliver to S3
 
 ### CloudWatch Metrics
 
@@ -188,6 +225,7 @@ Email notifications for:
 2. Verify data exists for the date being processed
 3. Check IAM permissions
 4. Manually invoke: `aws lambda invoke --function-name MaterializedViewRefresh --payload '{}' response.json`
+5. If the log says another refresh is running, wait a few minutes - it retries automatically
 
 ### High Query Costs
 
@@ -207,6 +245,8 @@ aws lambda invoke \
   response.json
 ```
 
+Optional payload fields: `date` (last send date to recompute, `YYYY-MM-DD`, default today UTC) and `lookback_days` (number of send dates, max 90). To rebuild all metrics after upgrading, run it once with `--cli-binary-format raw-in-base64-out --payload '{"lookback_days": 90}'`.
+
 ### Update Refresh Schedule
 
 Edit `config.json` and redeploy:
@@ -223,8 +263,8 @@ Then: `cdk deploy`
 
 Works seamlessly with [Scheduled Campaigns Stack](../ses_scheduled_campaigns/):
 
-- Both use the same SES `configuration_set`
-- Scheduled campaigns automatically include proper tags
+- Select this stack's configuration set when scheduling (selected by default)
+- Scheduled campaigns automatically include `campaign_id` and `campaign_name` tags
 - All events flow into this analytics pipeline
 - Query scheduled campaign performance using materialized views
 

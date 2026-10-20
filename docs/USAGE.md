@@ -377,12 +377,14 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
    2024-12-25 14:00
    ```
    Format: `YYYY-MM-DD HH:MM` (24-hour)
-5. Validation ensures future time
+5. Validation ensures future time (if it's less than a minute away by the time the campaign is created, it starts immediately)
 6. Click "Send Email" (actually schedules, doesn't send immediately)
 7. Confirmation shows:
    - Campaign ID
    - Scheduled time
    - Recipient count
+
+If scheduling fails, the error explains why - for example, the unsubscribe encryption key in the stack doesn't match the one in Settings.
 
 **What Happens**:
 1. CSV uploaded to S3
@@ -390,16 +392,22 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
 3. EventBridge rule scheduled
 4. At scheduled time, Lambda executes automatically
 5. Emails sent via SQS → Lambda pipeline
-6. 1 hour after execution, resources cleaned up
+6. CSV deleted once every recipient is enqueued; campaign record and progress kept for 90 days
 
 ### Managing Scheduled Campaigns
 
-**View Upcoming**:
+**View Campaigns**:
 1. Scheduled Campaigns tab
-2. Table shows only future campaigns
+2. Table shows campaigns of every status with sent/failed progress, newest first
 3. Click row to view details
 
-**Delete Before Execution**:
+**Cancel or Stop**:
+1. Select campaign from table
+2. Click "🚫 Cancel Campaign" (scheduled) or "⏹️ Stop Sending" (sending)
+3. Confirm
+4. Cancelled campaigns never run; stopped campaigns discard emails still waiting in the queue (emails already accepted by SES are still delivered)
+
+**Delete**:
 1. Select campaign from table
 2. Click "❌ Delete Selected"
 3. Confirm deletion
@@ -409,22 +417,20 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
    - DynamoDB entry
    - Analytics metadata
 
-**Important**: Cannot delete after execution starts. Automatic cleanup occurs 1 hour after execution.
+**Important**: A campaign that is sending can't be deleted - stop it first. Campaign records are kept for 90 days after the scheduled time.
 
 ### Configuring Sending Rate
 
-**Scheduled campaigns use Lambda concurrency, not TUI rate setting.**
+**Scheduled campaigns use `sendingRateTPS` in the stack config, not TUI rate setting.**
 
 **To adjust**:
-1. AWS Console → Lambda
-2. Find EmailSender function
-3. Configuration → Concurrency
-4. Set Reserved Concurrency
-5. Formula: `Concurrency × 20 = Target TPS`
-   - Example: 5 concurrency = ~100 TPS
-   - Example: 10 concurrency = ~200 TPS
+1. Edit `ses_scheduled_campaigns/config.json`
+2. Set `sendingRateTPS` (emails per second, shared by all campaigns)
+3. Run `cdk deploy`
 
-**Recommendation**: Start conservative, monitor CloudWatch logs for throttling.
+The stack sets the Lambda trigger's maximum concurrency to `ceil(TPS / 20)` and paces each invocation, so the total never exceeds `sendingRateTPS`.
+
+**Recommendation**: Keep it at or below your SES account's maximum send rate. Throttled emails are retried with backoff.
 
 ---
 
@@ -515,12 +521,14 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
 **Bounces**: Failed deliveries (hard bounces = permanent, soft bounces = temporary)  
 **Complaints**: Recipients who marked as spam
 
+**Counting methodology**: Every event is attributed to the day its email was **sent**, so an open or click that arrives days later counts toward the send day (each nightly refresh recomputes the last 14 send dates). Opens and Clicks are counted as **unique per email** (`COUNT(DISTINCT messageId)` on Open/Click events). Multiple opens of the same email by the same recipient, or clicks on multiple links within the same email, each count as 1. Tools that report *total* open/click events (e.g. Pinpoint's default campaign metrics) will produce higher numbers for the same underlying activity. No filtering is applied for machine/bot opens such as Apple Mail Privacy Protection prefetches — those are counted as opens.
+
 **Rates**:
 - **Delivery Rate**: Deliveries / Sends × 100
-- **Open Rate**: Opens / Deliveries × 100
-- **Click Rate**: Clicks / Deliveries × 100
+- **Open Rate**: Unique Opens / Deliveries × 100
+- **Click Rate**: Unique Clicks / Deliveries × 100
 - **Bounce Rate**: Bounces / Sends × 100
-- **Complaint Rate**: Complaints / Sends × 100
+- **Complaint Rate**: Complaints / Deliveries × 100
 
 **Healthy Benchmarks**:
 - Delivery Rate: >95%
@@ -543,10 +551,10 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
 5. Find optimal rate through testing
 
 **Scheduled Cloud Sending**:
-1. Start with Lambda concurrency of 5 (≈100 TPS)
+1. Start with `sendingRateTPS` at or below your SES max send rate
 2. Monitor CloudWatch logs for throttling
 3. If no throttling after several campaigns, increase gradually
-4. Check DLQ for permanent errors
+4. Check DLQ for permanent errors (the `EmailDlqAlarm` emails you when emails fail)
 
 ### Campaign Organization
 

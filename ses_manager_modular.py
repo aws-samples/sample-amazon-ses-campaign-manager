@@ -120,6 +120,7 @@ class SESManagerApp(App):
             
             # Scheduled Campaigns tab buttons
             "refresh-scheduled-campaigns-btn": lambda: self.scheduled_campaigns_ui.handle_refresh_campaigns() if self.scheduled_campaigns_ui else None,
+            "cancel-scheduled-campaign-btn": lambda: self.scheduled_campaigns_ui.handle_cancel_campaign() if self.scheduled_campaigns_ui else None,
             "delete-scheduled-campaign-btn": lambda: self.scheduled_campaigns_ui.handle_delete_campaign() if self.scheduled_campaigns_ui else None,
         }
     
@@ -746,6 +747,17 @@ class SESManagerApp(App):
                         display_text += f"⏱️  Schedule: Immediate execution\n"
                     else:
                         display_text += f"📅 Scheduled: {schedule_val}\n"
+                        
+                        # Sent/failed counts for scheduled campaigns live in the scheduler table
+                        manager = self.scheduled_campaigns_manager
+                        live_status = manager.get_campaign_status(campaign_id) if manager and manager.is_deployed else None
+                        if live_status:
+                            display_text += (
+                                f"📬 Send Status: {live_status.get('status')} - "
+                                f"{live_status.get('sent_count', 0)} sent, "
+                                f"{live_status.get('failed_count', 0)} failed "
+                                f"of {live_status.get('total_recipients', 0)}\n"
+                            )
                 
                 if metadata.get('created_at'):
                     display_text += f"🕐 Created: {metadata['created_at']}\n"
@@ -756,6 +768,9 @@ class SESManagerApp(App):
                     'description', 'creator', 'configuration_set', 'created_at', 'updated_at',
                     'is_hidden', 'hidden_at'  # Exclude hidden status fields as we show them above
                 }
+                if metadata.get('schedule', 'immediate') != 'immediate':
+                    # Older scheduled records stored placeholder zero counts - live counts are shown above
+                    excluded_fields |= {'success_count', 'failed_count', 'success_rate'}
                 
                 other_metadata = {k: v for k, v in metadata.items() if k not in excluded_fields}
                 if other_metadata:
@@ -1333,12 +1348,12 @@ class SESManagerApp(App):
                     f"Total Soft Bounces: {int(float(overview.get('total_soft_bounces', 0) or 0)):,}\n"
                     f"Total Complaints: {int(float(overview.get('total_complaints', 0) or 0)):,}\n"
                     f"Total Rendering Failures: {int(float(overview.get('total_rendering_failures', 0) or 0)):,}\n"
-                    f"Avg Delivery Rate: {float(overview.get('avg_delivery_rate', 0) or 0):.2f}%\n"
-                    f"Avg Hard Bounce Rate: {float(overview.get('avg_hard_bounce_rate', 0) or 0):.2f}%\n"
-                    f"Avg Complaint Rate: {float(overview.get('avg_complaint_rate', 0) or 0):.2f}%\n"
-                    f"Avg Rendering Failure Rate: {float(overview.get('avg_rendering_failure_rate', 0) or 0):.2f}%\n"
-                    f"Avg Open Rate: {float(overview.get('avg_open_rate', 0) or 0):.2f}%\n"
-                    f"Avg Click Rate: {float(overview.get('avg_click_rate', 0) or 0):.2f}%"
+                    f"Delivery Rate: {float(overview.get('avg_delivery_rate', 0) or 0):.2f}%\n"
+                    f"Hard Bounce Rate: {float(overview.get('avg_hard_bounce_rate', 0) or 0):.2f}%\n"
+                    f"Complaint Rate: {float(overview.get('avg_complaint_rate', 0) or 0):.2f}%\n"
+                    f"Rendering Failure Rate: {float(overview.get('avg_rendering_failure_rate', 0) or 0):.2f}%\n"
+                    f"Open Rate: {float(overview.get('avg_open_rate', 0) or 0):.2f}%\n"
+                    f"Click Rate: {float(overview.get('avg_click_rate', 0) or 0):.2f}%"
                 )
             
             # Load campaigns for the period
@@ -1609,12 +1624,12 @@ class SESManagerApp(App):
                     f"Total Soft Bounces: {int(float(overview.get('total_soft_bounces', 0) or 0)):,}\n"
                     f"Total Complaints: {int(float(overview.get('total_complaints', 0) or 0)):,}\n"
                     f"Total Rendering Failures: {int(float(overview.get('total_rendering_failures', 0) or 0)):,}\n"
-                    f"Avg Delivery Rate: {float(overview.get('avg_delivery_rate', 0) or 0):.2f}%\n"
-                    f"Avg Hard Bounce Rate: {float(overview.get('avg_hard_bounce_rate', 0) or 0):.2f}%\n"
-                    f"Avg Complaint Rate: {float(overview.get('avg_complaint_rate', 0) or 0):.2f}%\n"
-                    f"Avg Rendering Failure Rate: {float(overview.get('avg_rendering_failure_rate', 0) or 0):.2f}%\n"
-                    f"Avg Open Rate: {float(overview.get('avg_open_rate', 0) or 0):.2f}%\n"
-                    f"Avg Click Rate: {float(overview.get('avg_click_rate', 0) or 0):.2f}%"
+                    f"Delivery Rate: {float(overview.get('avg_delivery_rate', 0) or 0):.2f}%\n"
+                    f"Hard Bounce Rate: {float(overview.get('avg_hard_bounce_rate', 0) or 0):.2f}%\n"
+                    f"Complaint Rate: {float(overview.get('avg_complaint_rate', 0) or 0):.2f}%\n"
+                    f"Rendering Failure Rate: {float(overview.get('avg_rendering_failure_rate', 0) or 0):.2f}%\n"
+                    f"Open Rate: {float(overview.get('avg_open_rate', 0) or 0):.2f}%\n"
+                    f"Click Rate: {float(overview.get('avg_click_rate', 0) or 0):.2f}%"
                 )
             
             # Update table
