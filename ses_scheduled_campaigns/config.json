@@ -3,8 +3,9 @@
   "notificationEmail": "YOUR_EMAIL@example.com",
   "sendingRateTPS": 100,
   "sqsVisibilityTimeout": 300,
-  "_comment_unsubscribe": "Copied from Amazon SES Campaign Manager config/settings.json - keep in sync",
-  "unsubscribeEncryptionKey": "nQiuJ2OHolEDHBaHK412SpIdUIXln1r2r7tWtZfyp7I=",
+  "_comment_unsubscribe": "Key must match email.unsubscribe_encryption_key in Amazon SES Campaign Manager config/settings.json. Prefer storing it in an SSM SecureString and setting unsubscribeEncryptionKeyParameter instead of unsubscribeEncryptionKey.",
+  "unsubscribeEncryptionKey": "",
+  "unsubscribeEncryptionKeyParameter": "",
   "unsubscribeBaseUrl": "https://www.hello.com",
   "unsubscribeEndpointUrl": "https://www.hello.com",
   "unsubscribeMailto": "unsubscribe@mailme.com"

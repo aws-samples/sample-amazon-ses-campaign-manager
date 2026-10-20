@@ -48,6 +48,7 @@ class ScheduledCampaignsManager:
         
         self.stack_info = None
         self.is_deployed = False
+        self.last_error = None  # Error message from the most recent failed scheduler call
         self.analytics_info = None
         self.analytics_deployed = False
         
@@ -178,7 +179,8 @@ class ScheduledCampaignsManager:
         template_data: Optional[Dict[str, Any]] = None,
         unsubscribe_enabled: bool = False,
         unsubscribe_type: str = 'both',
-        unsubscribe_topic: Optional[str] = None
+        unsubscribe_topic: Optional[str] = None,
+        unsubscribe_key_fingerprint: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Schedule a campaign for future execution
@@ -191,17 +193,18 @@ class ScheduledCampaignsManager:
             from_email: Sender email address
             total_recipients: Total number of recipients
             configuration_set: SES configuration set (optional)
-            tags: Campaign tags (optional)
+            tags: Campaign tags (optional, campaign_id is added by the stack)
             template_data: Base template data (optional)
+            unsubscribe_key_fingerprint: Fingerprint of the local unsubscribe key, checked by the stack
             
         Returns:
-            Response dict with campaign_id if successful, None otherwise
+            Response dict with campaign_id if successful, None otherwise (see self.last_error)
         
         Note:
-            Sending rate (TPS) is configured in AWS Lambda EmailSender function's 
-            reserved concurrency setting. Default is 1 TPS. 
-            Formula: Reserved Concurrency × 20 = Target TPS
+            Sending rate (TPS) is set by sendingRateTPS in ses_scheduled_campaigns/config.json
+            and applies to all campaigns.
         """
+        self.last_error = None
         if not self.is_deployed:
             if self.logger:
                 self.logger.error("Scheduled campaigns stack not deployed", "SCHEDULED_CAMPAIGNS")
@@ -223,7 +226,8 @@ class ScheduledCampaignsManager:
                     'template_data': template_data or {},
                     'unsubscribe_enabled': unsubscribe_enabled,
                     'unsubscribe_type': unsubscribe_type,
-                    'unsubscribe_topic': unsubscribe_topic
+                    'unsubscribe_topic': unsubscribe_topic,
+                    'unsubscribe_key_fingerprint': unsubscribe_key_fingerprint
                 }
             }
             
@@ -241,17 +245,6 @@ class ScheduledCampaignsManager:
                 body = json.loads(result['body'])
                 campaign_id = body.get('campaign_id')
                 
-                # Also write to analytics table if deployed (for correlation with SES events)
-                if campaign_id and self.analytics_deployed:
-                    self.write_to_analytics_table(
-                        campaign_id=campaign_id,
-                        campaign_name=campaign_name,
-                        template_name=template_name,
-                        from_email=from_email,
-                        configuration_set=configuration_set,
-                        total_recipients=total_recipients
-                    )
-                
                 if self.logger:
                     self.logger.info(
                         f"Campaign scheduled: {campaign_id}",
@@ -260,21 +253,33 @@ class ScheduledCampaignsManager:
                 
                 return body
             else:
-                error = json.loads(result.get('body', '{}')).get('error', 'Unknown error')
+                self.last_error = self._error_from_result(result)
                 if self.logger:
                     self.logger.error(
-                        f"Failed to schedule campaign: {error}",
+                        f"Failed to schedule campaign: {self.last_error}",
                         "SCHEDULED_CAMPAIGNS"
                     )
                 return None
                 
         except Exception as e:
+            self.last_error = str(e)
             if self.logger:
                 self.logger.error(
                     f"Error scheduling campaign: {str(e)}",
                     "SCHEDULED_CAMPAIGNS"
                 )
             return None
+    
+    @staticmethod
+    def _error_from_result(result: Dict[str, Any]) -> str:
+        """Extract the error message from a scheduler Lambda response"""
+        # Unhandled Lambda errors come back as errorMessage instead of statusCode/body
+        if result.get('errorMessage'):
+            return result['errorMessage']
+        try:
+            return json.loads(result.get('body') or '{}').get('error', 'Unknown error')
+        except (TypeError, ValueError):
+            return 'Unknown error'
     
     def list_campaigns(
         self,
@@ -286,9 +291,10 @@ class ScheduledCampaignsManager:
         List scheduled campaigns
         
         Args:
-            status_filter: Filter by status (SCHEDULED, PROCESSING, COMPLETED, etc.)
+            status_filter: Filter by status (SCHEDULED, PROCESSING, COMPLETED, FAILED, STOPPED, CANCELLED)
             limit: Maximum number of campaigns to return
-            future_only: If True, only return campaigns scheduled in the future (default: True)
+            future_only: If True, only return SCHEDULED campaigns in the future (default: True).
+                         If False, return campaigns of every status (or status_filter), newest first.
             
         Returns:
             List of campaign dicts if successful, None otherwise
@@ -391,18 +397,19 @@ class ScheduledCampaignsManager:
                 )
             return None
     
-    def cancel_campaign(self, campaign_id: str) -> bool:
+    def cancel_campaign(self, campaign_id: str) -> Optional[Dict[str, Any]]:
         """
-        Cancel a scheduled campaign
+        Cancel a scheduled campaign, or stop one that is currently sending
         
         Args:
             campaign_id: Campaign ID to cancel
             
         Returns:
-            True if successful, False otherwise
+            Response dict with the new status and a message, None otherwise (see self.last_error)
         """
+        self.last_error = None
         if not self.is_deployed:
-            return False
+            return None
         
         try:
             payload = {
@@ -419,22 +426,25 @@ class ScheduledCampaignsManager:
             result = json.loads(response['Payload'].read())
             
             if result.get('statusCode') == 200:
+                body = json.loads(result['body'])
                 if self.logger:
                     self.logger.info(
-                        f"Campaign cancelled: {campaign_id}",
+                        f"Campaign {campaign_id} is now {body.get('status')}",
                         "SCHEDULED_CAMPAIGNS"
                     )
-                return True
+                return body
             
-            return False
+            self.last_error = self._error_from_result(result)
+            return None
             
         except Exception as e:
+            self.last_error = str(e)
             if self.logger:
                 self.logger.error(
                     f"Error cancelling campaign: {str(e)}",
                     "SCHEDULED_CAMPAIGNS"
                 )
-            return False
+            return None
     
     def delete_campaign(self, campaign_id: str, schedule_timestamp: int, csv_s3_path: str = None) -> bool:
         """
@@ -620,9 +630,8 @@ class ScheduledCampaignsManager:
                 'total_recipients': total_recipients,
                 'created_at': datetime.now().isoformat(),  # ISO format string
                 'schedule': schedule_time.isoformat() if schedule_time else 'immediate',
-                'success_count': 0,  # Will be updated as emails are sent
-                'failed_count': 0,   # Will be updated as emails fail
-                'success_rate': 0    # Will be calculated later
+                # Sent/failed counts for scheduled campaigns live in the scheduler table
+                # (see get_campaign_status), so no placeholder counts are stored here
             }
             
             # Add optional fields

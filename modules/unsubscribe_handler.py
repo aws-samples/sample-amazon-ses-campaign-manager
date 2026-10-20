@@ -5,8 +5,10 @@ Handles email unsubscribe functionality including encryption and header generati
 """
 
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 from cryptography.fernet import Fernet
 import base64
+import hashlib
 
 from config.settings import settings
 from modules.logger import get_logger
@@ -32,6 +34,18 @@ class UnsubscribeHandler:
     def get_encryption_key(self) -> Optional[str]:
         """Get the encryption key from settings."""
         return self.settings.get('email.unsubscribe_encryption_key')
+    
+    def get_key_fingerprint(self) -> str:
+        """
+        Short one-way fingerprint of the encryption key.
+        
+        Sent when scheduling so the cloud stack can confirm it uses the same key
+        (must match key_fingerprint() in ses_scheduled_campaigns/lambda/unsubscribe_config.py).
+        """
+        key = self.get_encryption_key()
+        if not key:
+            return ''
+        return hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
     
     def set_encryption_key(self, key: str) -> None:
         """Save the encryption key to settings."""
@@ -104,7 +118,7 @@ class UnsubscribeHandler:
         # Construct the unsubscribe URL
         url = f"{base_url}?user={encrypted_email}"
         if topic:
-            url += f"&topic={topic}"
+            url += f"&topic={quote(topic, safe='')}"
         
         # Note: Per-email logging disabled to prevent massive log files with bulk sends
         # if self.logger:
@@ -149,7 +163,7 @@ class UnsubscribeHandler:
             # Add HTTPS unsubscribe URL
             url = f"{unsubscribe_url}?address={encrypted_email}"
             if topic:
-                url += f"&topic={topic}"
+                url += f"&topic={quote(topic, safe='')}"
             unsubscribe_options.append(f"<{url}>")
         
         if mailto_address:

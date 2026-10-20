@@ -251,12 +251,13 @@ class CampaignAnalyticsManager:
               SUM(soft_bounces) as total_soft_bounces,
               SUM(complaints) as total_complaints,
               SUM(rendering_failures) as total_rendering_failures,
-              AVG(delivery_rate) as overall_delivery_rate,
-              AVG(open_rate) as overall_open_rate,
-              AVG(click_rate) as overall_click_rate,
-              AVG(hard_bounce_rate) as overall_hard_bounce_rate,
-              AVG(complaint_rate) as overall_complaint_rate,
-              AVG(rendering_failure_rate) as overall_rendering_failure_rate,
+              -- Rates from totals (an average of daily rates would weight a 10-email day like a 50k one)
+              CAST(SUM(emails_delivered) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_delivery_rate,
+              CAST(SUM(emails_opened) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_open_rate,
+              CAST(SUM(emails_clicked) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_click_rate,
+              CAST(SUM(hard_bounces) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_hard_bounce_rate,
+              CAST(SUM(complaints) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_complaint_rate,
+              CAST(SUM(rendering_failures) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_rendering_failure_rate,
               COUNT(DISTINCT date) as days_active
             FROM {self.database_name}.campaign_metrics_daily
             WHERE date >= CAST(current_date - interval '{days}' day AS VARCHAR)
@@ -343,7 +344,7 @@ class CampaignAnalyticsManager:
               delivery_rate,
               open_rate,
               click_rate,
-              bounce_rate,
+              hard_bounce_rate as bounce_rate,
               complaint_rate,
               unique_recipients,
               avg_delivery_time_ms
@@ -433,6 +434,7 @@ class CampaignAnalyticsManager:
             # nosec B608 - No user input in SQL query
             query = f"""
             SELECT
+              campaign_id,
               campaign_name,
               MIN(date) as first_send_date,
               MAX(date) as last_send_date,
@@ -444,12 +446,13 @@ class CampaignAnalyticsManager:
               SUM(soft_bounces) as total_soft_bounces,
               SUM(complaints) as total_complaints,
               SUM(rendering_failures) as total_rendering_failures,
-              AVG(delivery_rate) as overall_delivery_rate,
-              AVG(open_rate) as overall_open_rate,
-              AVG(click_rate) as overall_click_rate,
-              AVG(hard_bounce_rate) as overall_hard_bounce_rate,
-              AVG(complaint_rate) as overall_complaint_rate,
-              AVG(rendering_failure_rate) as overall_rendering_failure_rate,
+              -- Rates from totals (an average of daily rates would weight a 10-email day like a 50k one)
+              CAST(SUM(emails_delivered) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_delivery_rate,
+              CAST(SUM(emails_opened) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_open_rate,
+              CAST(SUM(emails_clicked) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_click_rate,
+              CAST(SUM(hard_bounces) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_hard_bounce_rate,
+              CAST(SUM(complaints) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100 as overall_complaint_rate,
+              CAST(SUM(rendering_failures) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100 as overall_rendering_failure_rate,
               COUNT(DISTINCT date) as days_active
             FROM {self.database_name}.campaign_metrics_daily
             WHERE 1=1
@@ -465,20 +468,17 @@ class CampaignAnalyticsManager:
                 safe_campaign = campaign_name.replace("'", "''")
                 query += f" AND campaign_name = '{safe_campaign}'"
             
-            query += " GROUP BY campaign_name"
+            query += " GROUP BY campaign_id, campaign_name"
             query += " ORDER BY MIN(date) DESC, total_sent DESC LIMIT 100"
             
             results = await self._execute_query_async(query)
             
             # Filter out hidden campaigns if metadata manager is available
-            # Note: This query doesn't include campaign_id, so we need to look up by campaign_name
             if not show_hidden and self.metadata_manager and self.metadata_manager.enabled:
                 original_count = len(results)
                 filtered_results = []
                 for campaign in results:
-                    # Try to find metadata by campaign name (less reliable than campaign_id)
-                    # In practice, you may want to modify the query to include campaign_id
-                    metadata = await self.get_campaign_metadata(campaign.get('campaign_name', ''))
+                    metadata = await self.get_campaign_metadata(campaign.get('campaign_id', ''))
                     if not metadata or not metadata.get('is_hidden', False):
                         filtered_results.append(campaign)
                 
@@ -629,12 +629,13 @@ class CampaignAnalyticsManager:
               COALESCE(SUM(soft_bounces), 0) as total_soft_bounces,
               COALESCE(SUM(complaints), 0) as total_complaints,
               COALESCE(SUM(rendering_failures), 0) as total_rendering_failures,
-              COALESCE(AVG(delivery_rate), 0.0) as avg_delivery_rate,
-              COALESCE(AVG(open_rate), 0.0) as avg_open_rate,
-              COALESCE(AVG(click_rate), 0.0) as avg_click_rate,
-              COALESCE(AVG(hard_bounce_rate), 0.0) as avg_hard_bounce_rate,
-              COALESCE(AVG(complaint_rate), 0.0) as avg_complaint_rate,
-              COALESCE(AVG(rendering_failure_rate), 0.0) as avg_rendering_failure_rate
+              -- Overall rates from totals across all campaigns in the period
+              COALESCE(CAST(SUM(emails_delivered) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100, 0.0) as avg_delivery_rate,
+              COALESCE(CAST(SUM(emails_opened) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100, 0.0) as avg_open_rate,
+              COALESCE(CAST(SUM(emails_clicked) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100, 0.0) as avg_click_rate,
+              COALESCE(CAST(SUM(hard_bounces) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100, 0.0) as avg_hard_bounce_rate,
+              COALESCE(CAST(SUM(complaints) AS DOUBLE) / NULLIF(SUM(emails_delivered), 0) * 100, 0.0) as avg_complaint_rate,
+              COALESCE(CAST(SUM(rendering_failures) AS DOUBLE) / NULLIF(SUM(emails_sent), 0) * 100, 0.0) as avg_rendering_failure_rate
             FROM {self.database_name}.campaign_metrics_daily
             WHERE {date_filter}
             """
