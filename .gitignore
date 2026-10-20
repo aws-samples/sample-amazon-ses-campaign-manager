@@ -93,3 +93,21 @@ ses_campaign_analytics/.npmrc
 # Ensure CDK lib folders are tracked
 !ses_scheduled_campaigns/lib/
 !ses_campaign_analytics/lib/
+
+# Screenshots, email attachments and scratch files (the repo's own docs images stay tracked)
+screenshots/
+attachments/
+Screenshot*.png
+Screen Shot*.png
+image0*.png
+image0*.gif
+tmp/
+temp/
+*.tmp
+*.tmp.*
+*.bak
+*.orig
+*.rej
+# Output of the aws lambda invoke commands in the docs
+response.json
+payload.json
