@@ -26,7 +26,7 @@ Displays cached SES account details (refreshed on demand):
 - **Maximum Send Rate**: Emails per second allowed
 - **Account Status**: Production or sandbox mode
 
-**Why cached?** Amazon SES management APIs are limited to 1 TPS. Caching prevents rate limit errors while keeping data reasonably fresh (60-minute TTL).
+**Why cached?** Amazon SES management APIs are limited to 1 TPS. Caching prevents rate limit errors while keeping data reasonably fresh (10-minute TTL).
 
 ### Metrics Visualization
 

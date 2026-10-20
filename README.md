@@ -144,10 +144,10 @@ Your Machine → AWS CLI Credentials → Amazon SES API
 - **Scheduled (Cloud)**: No progress tracking in TUI (executes in Lambda). Monitor via CloudWatch logs
 
 **Caching Layer**
-- File-based JSON cache with configurable TTL per operation
+- File-based JSON cache with configurable TTL per operation, kept separate per AWS profile and region
 - **Critical for Amazon SES**: Management APIs limited to 1 TPS (e.g., list_configuration_sets, get_templates)
 - Prevents hitting rate limits during normal usage
-- TTL examples: Templates (30 min), Account details (60 min), Metrics (5 min)
+- TTL examples: Templates (30 min), Account details (10 min), Metrics (5 min)
 - Manually invalidate from Settings tab if needed
 
 **CSV-Based Bulk Sending**

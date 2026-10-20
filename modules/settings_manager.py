@@ -352,6 +352,7 @@ class SettingsTabHandler:
     def __init__(self, app, settings_manager: SettingsManager):
         self.app = app
         self.settings_manager = settings_manager
+        # Not tied to an account/region: only used for stats and clear-all across the whole cache folder
         self.cache_manager = CacheManager(settings)
     
     def update_settings_display(self) -> None:
@@ -472,6 +473,9 @@ Cache Size: {stats['cache_size_mb']} MB"""
         """Handle clearing all cache."""
         try:
             self.cache_manager.invalidate_all_cache()
+            # Campaign analytics keeps its own in-memory cache
+            if getattr(self.app, 'campaign_analytics_manager', None):
+                self.app.campaign_analytics_manager.campaigns_cache = None
             self.update_cache_stats_display()
             self.app.notify("All cache cleared successfully", severity="success")
         except Exception as e:
@@ -742,19 +746,10 @@ Mailto: {mailto if mailto else 'Not set'}"""
             # Get config set dropdown
             config_select = self.app.query_one("#default-config-set-select", Select)
             
-            # Get config sets from cache or fetch if not cached
+            # Get config sets (cached per account/region by the SES client)
             config_sets = []
             if hasattr(self.app, 'ses_client') and self.app.ses_client:
-                # Check cache first
-                cached_data = self.cache_manager.get_cached_data("get_configuration_sets")
-                
-                if cached_data:
-                    config_sets = cached_data
-                else:
-                    # Not in cache, fetch and cache it
-                    config_sets = self.app.ses_client.get_configuration_sets()
-                    if config_sets:
-                        self.cache_manager.set_cached_data("get_configuration_sets", config_sets)
+                config_sets = self.app.ses_client.get_configuration_sets()
             
             # Get saved default
             saved_default = self.settings_manager.get_default_configuration_set()

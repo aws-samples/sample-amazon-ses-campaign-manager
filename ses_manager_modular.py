@@ -12,7 +12,7 @@ from textual.binding import Binding
 from textual import on
 
 # Import our modular components
-from config.settings import Settings
+from config.settings import settings, PROJECT_ROOT
 from aws.ses_client import SESClient, get_aws_profiles
 from ui.screens import ProfileSelectionScreen, TemplateFormScreen, CSVValidationReportScreen
 from ui.file_browser_screen import FileBrowserScreen
@@ -41,7 +41,8 @@ class SESManagerApp(App):
     
     def __init__(self):
         super().__init__()
-        self.settings = Settings()
+        # Share the global settings instance so every module reads and saves the same state
+        self.settings = settings
         # Initialize centralized logger
         self.logger = init_logger(self.settings)
         self.ses_client = None
@@ -267,7 +268,8 @@ class SESManagerApp(App):
                 # Initialize scheduled campaigns manager and UI
                 self.scheduled_campaigns_manager = ScheduledCampaignsManager(
                     region=region_name,
-                    settings_instance=self.settings
+                    settings_instance=self.settings,
+                    profile=profile_name
                 )
                 self.scheduled_campaigns_ui = ScheduledCampaignsUI(self, self.scheduled_campaigns_manager)
                 
@@ -301,7 +303,8 @@ class SESManagerApp(App):
                     # Initialize scheduled campaigns even if AWS connection failed
                     self.scheduled_campaigns_manager = ScheduledCampaignsManager(
                         region=region_name,
-                        settings_instance=self.settings
+                        settings_instance=self.settings,
+                        profile=profile_name
                     )
                     self.scheduled_campaigns_ui = ScheduledCampaignsUI(self, self.scheduled_campaigns_manager)
                     
@@ -536,7 +539,8 @@ class SESManagerApp(App):
         if not self.scheduled_campaigns_manager:
             self.scheduled_campaigns_manager = ScheduledCampaignsManager(
                 region=self.current_region,
-                settings_instance=self.settings
+                settings_instance=self.settings,
+                profile=self.current_profile
             )
         if not self.scheduled_campaigns_ui:
             self.scheduled_campaigns_ui = ScheduledCampaignsUI(self, self.scheduled_campaigns_manager)
@@ -902,6 +906,11 @@ class SESManagerApp(App):
     async def change_profile(self) -> None:
         """Change AWS profile and region."""
         try:
+            # The bulk sender holds the current account's client, so don't switch mid-send
+            if getattr(self, 'email_composer', None) and self.email_composer.bulk_sending:
+                self.notify("Finish or cancel the bulk send before changing profile", severity="warning")
+                return
+            
             profiles = get_aws_profiles()
             config = await self.push_screen_wait(ProfileSelectionScreen(profiles))
             
@@ -909,19 +918,32 @@ class SESManagerApp(App):
                 profile_name = config["profile"]
                 region_name = config["region"]
                 
-                # Save the new configuration
-                self.settings.set_aws_config(profile_name, region_name)
-                
                 # Reinitialize components
                 self.update_status_bar(f"Reconnecting to Amazon SES ({profile_name} - {region_name})...")
                 
                 self.ses_client = SESClient(profile_name, region_name, self.settings)
+                
+                # Save the new configuration only once the connection works
+                self.settings.set_aws_config(profile_name, region_name)
+                
                 self.templates_manager = TemplatesManager(self, self.ses_client)
                 self.email_sender = EmailSender(self.ses_client, self.settings)
                 self.dashboard_manager = DashboardManager(self, self.ses_client)
+                self.campaign_analytics_manager = CampaignAnalyticsManager(self, self.ses_client, self.settings)
+                self.scheduled_campaigns_manager = ScheduledCampaignsManager(
+                    region=region_name,
+                    settings_instance=self.settings,
+                    profile=profile_name
+                )
+                self.scheduled_campaigns_ui = ScheduledCampaignsUI(self, self.scheduled_campaigns_manager)
+                self.selected_campaign_id = None
+                self.selected_campaign_name = None
                 
                 self.current_profile = profile_name
                 self.current_region = region_name
+                
+                # Remove the send form so it is rebuilt with the new account's client, identities and config sets
+                await self.query("#send-email-enhanced-container, #send-email-error").remove()
                 
                 # Refresh data
                 await self.refresh_all_data()
@@ -1095,7 +1117,7 @@ class SESManagerApp(App):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_name = Path(validation_data['filename']).stem
             report_filename = f"validation_report_{base_name}_{timestamp}.txt"
-            report_path = Path("bulk_email_csv") / "bulk_email_output" / report_filename
+            report_path = PROJECT_ROOT / "bulk_email_csv" / "bulk_email_output" / report_filename
             
             # Ensure directory exists
             report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2206,13 +2228,8 @@ class SESManagerApp(App):
         """Handle refresh configuration sets button."""
         try:
             if self.ses_client:
-                # Force refresh by clearing cache
-                from modules.cache_manager import CacheManager
-                cache_mgr = CacheManager(self.settings)
-                cache_mgr.invalidate_cache("get_configuration_sets")
-                
-                # Get fresh list
-                config_sets = self.ses_client.get_configuration_sets()
+                # Get fresh list (bypasses and updates the cache)
+                config_sets = self.ses_client.get_configuration_sets(force_refresh=True)
                 
                 # Update dropdown
                 from textual.widgets import Select

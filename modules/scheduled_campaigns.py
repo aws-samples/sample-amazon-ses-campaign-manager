@@ -15,13 +15,14 @@ from modules.logger import get_logger
 class ScheduledCampaignsManager:
     """Manages integration with cloud-based scheduled campaigns"""
     
-    def __init__(self, region=None, settings_instance=None):
+    def __init__(self, region=None, settings_instance=None, profile=None):
         """
         Initialize ScheduledCampaignsManager
         
         Args:
             region: AWS region (if None, will try to get from settings)
             settings_instance: Settings manager instance to get region from
+            profile: AWS profile name (same profile as the SES client; None uses the default chain)
         """
         # Get region from settings if available, otherwise use default
         if region:
@@ -33,10 +34,16 @@ class ScheduledCampaignsManager:
             import os
             self.region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
         
-        self.lambda_client = boto3.client('lambda', region_name=self.region)
-        self.s3_client = boto3.client('s3', region_name=self.region)
-        self.cloudformation = boto3.client('cloudformation', region_name=self.region)
-        self.dynamodb = boto3.resource('dynamodb', region_name=self.region)
+        # Use the selected profile so campaigns are scheduled in the same account as the SES client
+        if profile and profile != 'default':
+            session = boto3.Session(profile_name=profile)
+        else:
+            session = boto3.Session()
+        
+        self.lambda_client = session.client('lambda', region_name=self.region)
+        self.s3_client = session.client('s3', region_name=self.region)
+        self.cloudformation = session.client('cloudformation', region_name=self.region)
+        self.dynamodb = session.resource('dynamodb', region_name=self.region)
         self.logger = get_logger()
         
         self.stack_info = None
