@@ -701,7 +701,7 @@ class EmailComposer:
             validation_result = self.csv_validator.validate_csv_file(
                 csv_path=csv_path,
                 check_duplicates=True,
-                max_rows=50000,
+                max_rows=settings.get('email.max_csv_rows', CSVValidator.MAX_ROWS),
                 template_name=template_name if template_name != Select.BLANK else None
             )
             
@@ -1322,7 +1322,7 @@ class EmailComposer:
             validation_result = self.csv_validator.validate_csv_file(
                 csv_path=csv_path,
                 check_duplicates=True,
-                max_rows=50000,
+                max_rows=settings.get('email.max_csv_rows', CSVValidator.MAX_ROWS),
                 template_name=template_name if template_name != Select.BLANK else None
             )
             

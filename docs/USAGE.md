@@ -214,7 +214,7 @@ When you browse and select a CSV file, it's automatically validated before loadi
   - Missing required `To_Address` column
   - CSV file has no headers
   - CSV file is empty (no data rows)
-  - File exceeds 50,000 row limit
+  - File exceeds the row limit (100,000 by default)
 - **Data Issues**:
   - Invalid email format in `To_Address` column
   - Empty email address in `To_Address` column
@@ -269,7 +269,7 @@ jane@example.com,Jane Smith,Tech Inc,15%,2024-12-31
 - Prefix automatically removed for template data
 - UTF-8 encoding
 - No special characters in column names
-- Maximum 50,000 rows
+- Maximum 100,000 rows by default (change `email.max_csv_rows` in `config/settings.json`)
 - Maximum 50MB file size
 
 **Example Template for CSV Above**:

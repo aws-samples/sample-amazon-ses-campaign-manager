@@ -220,6 +220,8 @@ cdk --version
 cdk bootstrap aws://ACCOUNT-ID/REGION
 ```
 
+**Python 3 with pip (or Docker)**: the Scheduled Campaigns stack builds its `cryptography` Lambda layer during `cdk deploy`, using `python3`, `python` or `py` from your PATH and falling back to Docker.
+
 ### Scheduled Campaigns Stack
 
 **Purpose**: Schedule bulk email campaigns for future execution.
@@ -389,6 +391,8 @@ cdk destroy
 Upgrade in place with `git pull` and `cdk deploy`. **Don't destroy and redeploy**: every stack change is an in-place update, while destroying deletes campaign records and analytics metadata, strands raw event and CSV data in retained S3 buckets, and leaves EventBridge rules for upcoming campaigns pointing at a deleted function.
 
 1. **Pick a quiet time.** Don't upgrade while a scheduled campaign is sending (campaigns scheduled for later are fine and are picked up by the new version).
+
+   Check `SesScheduledCampaignsStack` in the CloudFormation console first. Previous versions referenced a third-party Lambda layer version (`Klayers-p312-cryptography:13`) that has since been deleted, so any update that changed a function's configuration failed and rolled back. A stack in `UPDATE_ROLLBACK_COMPLETE` still works and can be updated normally; older versions of Amazon SES Campaign Manager treated it as not deployed and hid the Scheduled Campaign mode. If it shows `UPDATE_ROLLBACK_FAILED`, choose **Stack actions → Continue update rollback** first. This version builds the layer itself during deploy.
 
 2. **Keep your configuration.** `git pull` refuses to overwrite the `config.json` files you edited, so stash them first:
    ```bash

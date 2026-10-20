@@ -52,7 +52,7 @@ class CSVValidator:
     
     # Limits
     MAX_FILE_SIZE_MB = 50
-    MAX_ROWS = 50000
+    MAX_ROWS = 100000  # Default; override with the email.max_csv_rows setting
     
     def __init__(self, logger=None, ses_client=None):
         """
@@ -471,6 +471,6 @@ def validate_bulk_email_csv(
     return validator.validate_csv_file(
         csv_path=csv_path,
         check_duplicates=True,
-        max_rows=50000,
+        max_rows=CSVValidator.MAX_ROWS,
         template_name=template_name
     )

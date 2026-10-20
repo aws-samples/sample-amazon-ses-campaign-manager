@@ -73,7 +73,7 @@ The diagram above shows how the three components work together:
   - Empty substitution variables (prevents rendering failures)
   - **Template variable mismatch**: Missing or extra substitution columns vs template
   - Empty CSV file
-  - Exceeds 50,000 row limit
+  - Exceeds the row limit (100,000 by default, `email.max_csv_rows` in `config/settings.json`)
 - **Non-blocking warnings** allow sending but should be reviewed:
   - Duplicate email addresses
   - No substitution columns found

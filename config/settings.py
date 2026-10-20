@@ -6,13 +6,19 @@ Handles loading and saving application configuration
 
 import json
 import os
+import sys
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 
 
 # Anchor app data folders to the project, not the current working directory
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if getattr(sys, 'frozen', False):
+    # Packaged executable (e.g. PyInstaller): __file__ points inside the bundle, which can be a
+    # temporary folder deleted on exit - keep settings, cache and logs next to the .exe instead
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings:
@@ -44,7 +50,8 @@ class Settings:
                 "unsubscribe_encryption_key": None,
                 "unsubscribe_base_url": "",
                 "unsubscribe_endpoint_url": "",
-                "unsubscribe_mailto": ""
+                "unsubscribe_mailto": "",
+                "max_csv_rows": 100000
             },
             "ses": {
                 "sending_rate": 1
