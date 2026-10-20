@@ -12,6 +12,14 @@ from pathlib import Path
 from modules.logger import get_logger
 
 
+# Stack statuses where every resource exists and works. UPDATE_ROLLBACK_COMPLETE means the
+# last update failed and the stack is back on its previous (working) version.
+USABLE_STACK_STATUSES = {
+    'CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE',
+    'IMPORT_COMPLETE', 'IMPORT_ROLLBACK_COMPLETE',
+}
+
+
 class ScheduledCampaignsManager:
     """Manages integration with cloud-based scheduled campaigns"""
     
@@ -48,6 +56,7 @@ class ScheduledCampaignsManager:
         
         self.stack_info = None
         self.is_deployed = False
+        self.stack_status = None  # CloudFormation status of the scheduled campaigns stack, if found
         self.last_error = None  # Error message from the most recent failed scheduler call
         self.analytics_info = None
         self.analytics_deployed = False
@@ -74,12 +83,13 @@ class ScheduledCampaignsManager:
                 return False
             
             stack = response['Stacks'][0]
+            self.stack_status = stack['StackStatus']
             
-            if stack['StackStatus'] not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
+            if self.stack_status not in USABLE_STACK_STATUSES:
                 self.is_deployed = False
                 if self.logger:
                     self.logger.warning(
-                        f"Scheduled campaigns stack status: {stack['StackStatus']}",
+                        f"Scheduled campaigns stack status: {self.stack_status}",
                         "SCHEDULED_CAMPAIGNS"
                     )
                 return False
@@ -542,7 +552,7 @@ class ScheduledCampaignsManager:
             
             stack = response['Stacks'][0]
             
-            if stack['StackStatus'] not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
+            if stack['StackStatus'] not in USABLE_STACK_STATUSES:
                 self.analytics_deployed = False
                 return False
             

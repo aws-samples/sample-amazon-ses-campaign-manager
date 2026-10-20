@@ -14,7 +14,30 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { NagSuppressions } from 'cdk-nag';
+import { spawnSync } from 'child_process';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as path from 'path';
+
+/**
+ * Install Lambda layer packages with the local Python, downloading Linux wheels for the
+ * Python 3.12 runtime so no Docker is needed. Returns false so CDK falls back to Docker.
+ */
+function installLayerPackagesLocally(requirementsFile: string, targetDir: string): boolean {
+  const pipArgs = [
+    '-m', 'pip', 'install', '-r', requirementsFile, '--target', targetDir,
+    '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux2014_x86_64',
+    '--implementation', 'cp', '--python-version', '3.12', '--only-binary=:all:', '--upgrade', '--quiet',
+  ];
+  // python3 on macOS/Linux, python or the py launcher on Windows
+  for (const python of ['python3', 'python', 'py']) {
+    const result = spawnSync(python, pipArgs, { stdio: 'inherit' });
+    if (result.status === 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export interface SesScheduledCampaignsStackProps extends cdk.StackProps {
   campaignRetentionDays: number;
@@ -174,13 +197,29 @@ export class SesScheduledCampaignsStack extends cdk.Stack {
 
     //////// LAMBDA FUNCTION: CAMPAIGN PROCESSOR ////////
 
-    // Use AWS public Lambda layer for cryptography (Python 3.12)
-    // This is a public layer maintained by Klayers: https://github.com/keithrozario/Klayers
-    const cryptographyLayer = lambda.LayerVersion.fromLayerVersionArn(
-      this,
-      'CryptographyLayer',
-      `arn:aws:lambda:${cdk.Stack.of(this).region}:770693421928:layer:Klayers-p312-cryptography:13`
-    );
+    // Build the cryptography layer (unsubscribe link encryption) from lambda/requirements.txt
+    // during deployment. A third-party layer pinned to a version number breaks every deploy
+    // once that version is deleted, which is what happened to Klayers-p312-cryptography:13.
+    const layerRequirements = path.join(__dirname, '../lambda/requirements.txt');
+    const cryptographyLayer = new lambda.LayerVersion(this, 'CryptographyLayer', {
+      description: 'cryptography for unsubscribe link encryption',
+      compatibleRuntimes: [lambda.Runtime.PYTHON_3_12],
+      compatibleArchitectures: [lambda.Architecture.X86_64],
+      code: lambda.Code.fromAsset(path.dirname(layerRequirements), {
+        // Rebuild only when the pinned requirements change, not on every Lambda code change
+        assetHashType: cdk.AssetHashType.CUSTOM,
+        assetHash: crypto.createHash('sha256').update(fs.readFileSync(layerRequirements)).digest('hex'),
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+          command: ['bash', '-c', 'pip install -r requirements.txt -t /asset-output/python'],
+          local: {
+            tryBundle(outputDir: string) {
+              return installLayerPackagesLocally(layerRequirements, path.join(outputDir, 'python'));
+            },
+          },
+        },
+      }),
+    });
 
     // Lambda code without dependencies
     const lambdaCode = lambda.Code.fromAsset(path.join(__dirname, '../lambda'));

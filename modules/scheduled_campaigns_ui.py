@@ -391,6 +391,12 @@ class ScheduledCampaignsUI:
                 sched_info = stack_info.get('scheduled_campaigns', {})
 
                 status_text.update("✅ Scheduled Campaigns Stack Deployed")
+                if getattr(self.manager, 'stack_status', None) == 'UPDATE_ROLLBACK_COMPLETE':
+                    # Still works, but on the previous version - the last cdk deploy failed
+                    status_text.update(
+                        "⚠️  Scheduled Campaigns Stack Deployed, but its last update failed and was rolled back "
+                        "(UPDATE_ROLLBACK_COMPLETE). Check the stack's events in the CloudFormation console and redeploy."
+                    )
 
                 info = f"S3 Bucket: {sched_info.get('bucket_name', 'N/A')}\n"
                 info += f"DynamoDB Table: {sched_info.get('table_name', 'N/A')}\n"
@@ -408,11 +414,20 @@ class ScheduledCampaignsUI:
                 await self.load_scheduled_campaigns()
 
             else:
-                status_text.update("❌ Scheduled Campaigns Stack Not Deployed")
-                info_text.update(
-                    "The scheduled campaigns stack is required to view and manage scheduled campaigns.\n"
-                    "Deploy the ses_scheduled_campaigns CDK stack to use this feature."
-                )
+                stack_status = getattr(self.manager, 'stack_status', None) if self.manager else None
+                if stack_status:
+                    # Stack exists but isn't usable (e.g. a failed rollback) - say so instead of "not deployed"
+                    status_text.update(f"❌ Scheduled Campaigns Stack Not Usable (status: {stack_status})")
+                    info_text.update(
+                        "SesScheduledCampaignsStack exists in this region but is not in a usable state.\n"
+                        "Check the stack's events in the CloudFormation console, fix the error and redeploy."
+                    )
+                else:
+                    status_text.update("❌ Scheduled Campaigns Stack Not Deployed")
+                    info_text.update(
+                        "The scheduled campaigns stack is required to view and manage scheduled campaigns.\n"
+                        "Deploy the ses_scheduled_campaigns CDK stack in this region to use this feature."
+                    )
 
                 # Hide main content, show deployment message
                 try:

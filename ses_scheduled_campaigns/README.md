@@ -11,6 +11,7 @@ Cloud-based scheduled campaign system for Amazon SES that enables scheduling bul
 - AWS CLI configured
 - Node.js 18+ and npm
 - AWS CDK CLI: `npm install -g aws-cdk`
+- Python 3 with pip (or Docker) - used during `cdk deploy` to build the `cryptography` Lambda layer
 - SES verified domain/email
 - (Optional) SES in production mode for high throughput
 
@@ -214,7 +215,7 @@ Upgrade in place with `git pull` and `cdk deploy` - don't destroy and redeploy. 
 
 ## Cost Example
 
-Amazon SES Campaign Manager accepts CSV files of up to 50,000 recipients; larger campaigns can be scheduled by calling the `CampaignScheduler` Lambda directly.
+Amazon SES Campaign Manager accepts CSV files of up to 100,000 recipients by default (`email.max_csv_rows` in `config/settings.json`); larger campaigns can also be scheduled by calling the `CampaignScheduler` Lambda directly.
 
 **1 Million emails @ 100 TPS:**
 - Lambda invocations: 50,000 (20 emails each)
