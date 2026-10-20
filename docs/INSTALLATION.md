@@ -466,10 +466,10 @@ Settings tab → Cache Management → "Clear All"
 - Next requests fetch fresh from AWS
 
 **Manual Invalidation**:
-Delete specific cache files:
+Cache files are named `<profile>_<region>__<operation>.json`, so each AWS profile and region has its own cached data. Delete specific cache files:
 ```bash
-rm cache/get_templates.json
-rm cache/get_identities.json
+rm cache/*__get_templates.json
+rm cache/*__get_identities.json
 # etc.
 ```
 
@@ -524,7 +524,7 @@ aws ses get-account --profile your-profile
 **Solution**:
 1. Verify templates exist in AWS Console → SES → Email Templates
 2. Check correct region selected in Settings
-3. Clear template cache: `rm cache/get_templates.json`
+3. Clear template cache: `rm cache/*__get_templates.json`
 4. Refresh Templates tab
 
 #### Bulk sending throttled

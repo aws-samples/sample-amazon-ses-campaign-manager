@@ -11,11 +11,15 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 
 
+# Anchor app data folders to the project, not the current working directory
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
 class Settings:
     """Manages application settings with JSON persistence."""
-    
-    def __init__(self, config_dir: str = "config"):
-        self.config_dir = Path(config_dir)
+
+    def __init__(self, config_dir: Optional[str] = None):
+        self.config_dir = Path(config_dir) if config_dir else PROJECT_ROOT / "config"
         self.config_dir.mkdir(exist_ok=True)
         self.settings_file = self.config_dir / "settings.json"
         self._settings = self._load_settings()

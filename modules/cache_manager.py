@@ -5,22 +5,25 @@ Handles caching functionality for API responses to improve performance and reduc
 """
 
 import json
-import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 import hashlib
 
-from config.settings import Settings
+from config.settings import PROJECT_ROOT
 from modules.logger import get_logger
 
 
 class CacheManager:
     """Manages caching of API responses with configurable TTL and automatic expiration."""
     
-    def __init__(self, settings, cache_dir: str = "cache"):
+    def __init__(self, settings, namespace = None, cache_dir = None):
         self.settings = settings
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir else PROJECT_ROOT / "cache"
         self.cache_dir.mkdir(exist_ok=True)
+        
+        # Namespace (e.g. "<profile>_<region>") keeps data from different accounts/regions apart
+        self.namespace = re.sub(r'[^\w.-]', '_', namespace) if namespace else None
         
         # Default cache TTL in minutes (can be overridden in settings)
         self.default_ttl_minutes = self.settings.get('cache.default_ttl_minutes', 15)
@@ -38,29 +41,43 @@ class CacheManager:
             logger.cache_operation(message)
     
     def _get_cache_key(self, operation: str, params = None) -> str:
-        """Generate a unique cache key for an operation and its parameters."""
+        """Generate a unique cache key for an operation, its parameters and the namespace."""
+        cache_key = operation
         if params:
             # Create a consistent hash of the parameters
             params_str = json.dumps(params, sort_keys=True)
             params_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]  # nosec B324 - MD5 used for cache keys, not security
-            return f"{operation}_{params_hash}"
-        return operation
+            cache_key = f"{operation}_{params_hash}"
+        if self.namespace:
+            cache_key = f"{self.namespace}__{cache_key}"
+        return cache_key
     
     def _get_cache_file_path(self, cache_key: str) -> Path:
         """Get the file path for a cache key."""
         return self.cache_dir / f"{cache_key}.json"
     
-    def _is_cache_valid(self, cache_data, ttl_minutes = None, operation: str = None) -> bool:
-        """Check if cached data is still valid based on TTL."""
-        if not cache_data or 'timestamp' not in cache_data:
-            return False
-        
-        # Use provided TTL or default
-        ttl = ttl_minutes if ttl_minutes is not None else self.default_ttl_minutes
+    def _read_cache_file(self, operation: str, params = None):
+        """Read a cache entry regardless of expiry. Removes corrupted files."""
+        cache_file = self._get_cache_file_path(self._get_cache_key(operation, params))
+        if not cache_file.exists():
+            return None
         
         try:
-            cached_time = datetime.fromisoformat(cache_data['timestamp'])
-            expiry_time = cached_time + timedelta(minutes=ttl)
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, KeyError) as e:
+            self._log_debug(f"Cache ERROR - corrupted cache file {cache_file}: {e}")
+            cache_file.unlink(missing_ok=True)
+            return None
+    
+    def _is_cache_valid(self, cache_data, operation: str = None) -> bool:
+        """Check if cached data is still valid based on the expiry stored with it."""
+        # Entries written before expiry was stored with the data count as expired
+        if not cache_data or 'expires_at' not in cache_data:
+            return False
+        
+        try:
+            expiry_time = datetime.fromisoformat(cache_data['expires_at'])
             is_valid = datetime.now() < expiry_time
             
             if self.debug_logging:
@@ -71,60 +88,39 @@ class CacheManager:
             return is_valid
         except (ValueError, TypeError) as e:
             operation_info = f" for '{operation}'" if operation else ""
-            self._log_debug(f"Error parsing cache timestamp{operation_info}: {e}")
+            self._log_debug(f"Error parsing cache expiry{operation_info}: {e}")
             return False
     
-    def _auto_cleanup_expired(self) -> None:
-        """Automatically cleanup expired cache files periodically."""
-        # Only run cleanup every 10th call to avoid performance impact
-        if not hasattr(self, '_cleanup_counter'):
-            self._cleanup_counter = 0
-        
-        self._cleanup_counter += 1
-        if self._cleanup_counter % 10 == 0:
-            removed_count = self.cleanup_expired_cache()
-            if removed_count > 0:
-                self._log_debug(f"Auto-cleanup removed {removed_count} expired cache files")
-    
-    def get_cached_data(self, operation: str, params = None, ttl_minutes = None):
+    def get_cached_data(self, operation: str, params = None):
         """Get cached data for an operation if it exists and is valid."""
         if not self.cache_enabled:
             self._log_debug(f"Cache disabled, skipping get for operation: {operation}")
             return None
         
-        # Automatically cleanup expired cache files periodically
-        self._auto_cleanup_expired()
+        self._log_debug(f"Checking cache for operation: {operation}, key: {self._get_cache_key(operation, params)}")
         
-        cache_key = self._get_cache_key(operation, params)
-        cache_file = self._get_cache_file_path(cache_key)
-        
-        self._log_debug(f"Checking cache for operation: {operation}, key: {cache_key}")
-        
-        if not cache_file.exists():
-            self._log_debug(f"Cache MISS - file does not exist for operation: {operation}")
+        cache_data = self._read_cache_file(operation, params)
+        if cache_data is None:
+            self._log_debug(f"Cache MISS - no cache entry for operation: {operation}")
             return None
         
-        try:
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            
-            if self._is_cache_valid(cache_data, ttl_minutes, operation):
-                self._log_debug(f"Cache HIT - returning cached data for operation: {operation}")
-                return cache_data.get('data')
-            else:
-                self._log_debug(f"Cache EXPIRED - removing expired cache for operation: {operation}")
-                # Remove expired cache file
-                cache_file.unlink()
-                return None
-                
-        except (json.JSONDecodeError, FileNotFoundError, KeyError) as e:
-            self._log_debug(f"Cache ERROR - corrupted cache file {cache_file}: {e}")
-            # Remove corrupted cache file
-            if cache_file.exists():
-                cache_file.unlink()
-            return None
+        if self._is_cache_valid(cache_data, operation):
+            self._log_debug(f"Cache HIT - returning cached data for operation: {operation}")
+            return cache_data.get('data')
+        
+        # Expired entries are kept as a fallback for failed API calls; cleanup_expired_cache removes them
+        self._log_debug(f"Cache EXPIRED for operation: {operation}")
+        return None
     
-    def set_cached_data(self, operation: str, data, params = None) -> None:
+    def get_stale_data(self, operation: str, params = None):
+        """Get cached data for an operation even if it has expired."""
+        if not self.cache_enabled:
+            return None
+        
+        cache_data = self._read_cache_file(operation, params)
+        return cache_data.get('data') if cache_data else None
+    
+    def set_cached_data(self, operation: str, data, params = None, ttl_minutes = None) -> None:
         """Cache data for an operation."""
         if not self.cache_enabled:
             self._log_debug(f"Cache disabled, skipping set for operation: {operation}")
@@ -133,9 +129,15 @@ class CacheManager:
         cache_key = self._get_cache_key(operation, params)
         cache_file = self._get_cache_file_path(cache_key)
         
+        # Store the expiry with the entry so every reader and cleanup applies the same TTL
+        ttl = ttl_minutes if ttl_minutes is not None else self.default_ttl_minutes
+        now = datetime.now()
+        
         cache_data = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': now.isoformat(),
+            'expires_at': (now + timedelta(minutes=ttl)).isoformat(),
             'operation': operation,
+            'namespace': self.namespace,
             'params': params,
             'data': data
         }
@@ -145,7 +147,7 @@ class CacheManager:
                 json.dump(cache_data, f, indent=2, default=str)
             
             self._log_debug(f"Cached data for operation: {operation}, key: {cache_key}")
-            
+        
         except Exception as e:
             self._log_debug(f"Error writing cache file {cache_file}: {e}")
     
@@ -196,12 +198,12 @@ class CacheManager:
                         stats['valid_cache_files'] += 1
                     else:
                         stats['expired_cache_files'] += 1
-                        
+                
                 except Exception:
                     stats['expired_cache_files'] += 1
             
             stats['cache_size_mb'] = round(total_size / (1024 * 1024), 2)
-            
+        
         except Exception as e:
             self._log_debug(f"Error getting cache stats: {e}")
         
@@ -220,28 +222,19 @@ class CacheManager:
                     if not self._is_cache_valid(cache_data, operation=cache_data.get('operation', 'unknown')):
                         cache_file.unlink()
                         removed_count += 1
-                        
+                
                 except Exception:
                     # Remove corrupted cache files
-                    cache_file.unlink()
+                    cache_file.unlink(missing_ok=True)
                     removed_count += 1
             
             if removed_count > 0:
                 self._log_debug(f"Cleaned up {removed_count} expired cache files")
-                
+        
         except Exception as e:
             self._log_debug(f"Error during cache cleanup: {e}")
         
         return removed_count
-    
-    def update_settings(self, settings: Settings) -> None:
-        """Update cache manager settings."""
-        self.settings = settings
-        self.default_ttl_minutes = self.settings.get('cache.default_ttl_minutes', 15)
-        self.cache_enabled = self.settings.get('cache.enabled', True)
-        self.debug_logging = self.settings.get('app.debug_logging', False)
-        
-        self._log_debug(f"Cache settings updated - Enabled: {self.cache_enabled}, TTL: {self.default_ttl_minutes} minutes")
 
 
 class CachedAPIWrapper:
@@ -250,12 +243,13 @@ class CachedAPIWrapper:
     def __init__(self, cache_manager: CacheManager):
         self.cache_manager = cache_manager
     
-    def cached_call(self, 
-                   operation_name: str, 
-                   api_function, 
+    def cached_call(self,
+                   operation_name: str,
+                   api_function,
                    params = None,
                    ttl_minutes = None,
-                   force_refresh: bool = False):
+                   force_refresh: bool = False,
+                   cache_if = None):
         """
         Execute an API call with caching support.
         
@@ -265,6 +259,7 @@ class CachedAPIWrapper:
             params: Parameters for the API function
             ttl_minutes: Cache TTL in minutes (uses default if None)
             force_refresh: If True, bypass cache and force API call
+            cache_if: Optional check on the result; the result is only cached when it returns True
         
         Returns:
             The API response data
@@ -273,7 +268,7 @@ class CachedAPIWrapper:
         
         # Check cache first unless force refresh is requested
         if not force_refresh:
-            cached_data = self.cache_manager.get_cached_data(operation_name, params, ttl_minutes)
+            cached_data = self.cache_manager.get_cached_data(operation_name, params)
             if cached_data is not None:
                 self.cache_manager._log_debug(f"API WRAPPER: Returning cached data for {operation_name}")
                 return cached_data
@@ -281,35 +276,21 @@ class CachedAPIWrapper:
         # Cache miss or force refresh - call the API
         self.cache_manager._log_debug(f"API WRAPPER: Fetching fresh data from SES for {operation_name}")
         try:
-            if params:
-                # Call API function with parameters
-                result = api_function(**params)
-            else:
-                # Call API function without parameters
-                result = api_function()
-            
-            # Cache the result
-            self.cache_manager.set_cached_data(operation_name, result, params)
-            self.cache_manager._log_debug(f"API WRAPPER: Successfully fetched and cached data for {operation_name}")
-            
-            return result
-            
-        except Exception as e:
-            # If API call fails, try to return stale cache data as fallback
+            result = api_function(**params)
+        except Exception:
+            # If API call fails, return expired data for the same account/region as a fallback
             if not force_refresh:
-                # Look for any cached data, even if expired
-                cache_key = self.cache_manager._get_cache_key(operation_name, params)
-                cache_file = self.cache_manager._get_cache_file_path(cache_key)
-                
-                if cache_file.exists():
-                    try:
-                        with open(cache_file, 'r', encoding='utf-8') as f:
-                            cache_data = json.load(f)
-                        
-                        self.cache_manager._log_debug(f"API call failed, returning stale cache data for {operation_name}")
-                        return cache_data.get('data')
-                    except Exception:
-                        pass  # nosec B110 - Intentional - widget may not be mounted
-            
-            # Re-raise the original exception if no fallback available
-            raise e
+                stale_data = self.cache_manager.get_stale_data(operation_name, params)
+                if stale_data is not None:
+                    self.cache_manager._log_debug(f"API call failed, returning stale cache data for {operation_name}")
+                    return stale_data
+            raise
+        
+        # Don't cache partial or error results
+        if cache_if is None or cache_if(result):
+            self.cache_manager.set_cached_data(operation_name, result, params, ttl_minutes)
+            self.cache_manager._log_debug(f"API WRAPPER: Successfully fetched and cached data for {operation_name}")
+        else:
+            self.cache_manager._log_debug(f"API WRAPPER: Result for {operation_name} not cached (incomplete)")
+        
+        return result

@@ -10,7 +10,6 @@ from textual.containers import ScrollableContainer, Horizontal
 from textual.widgets import Static, Button, Select, DataTable, Label
 
 from config.settings import settings
-from modules.cache_manager import CacheManager, CachedAPIWrapper
 from modules.logger import get_logger
 from modules.notification_helper import notify_verbose
 
@@ -24,10 +23,6 @@ class DashboardManager:
         self.account_details = {}
         self.metrics_data = {}
         self.cloudwatch_client = None
-        
-        # Initialize caching
-        self.cache_manager = CacheManager(settings)
-        self.cached_api = CachedAPIWrapper(self.cache_manager)
         
         # Debug logging
         logger = get_logger()
@@ -79,50 +74,39 @@ class DashboardManager:
         if not self.ses_client:
             return
         
-        def _fetch_account_details():
-            # Get account details using SES v2 API
-            account_details = {}
-            
-            # Get account information using SES v2 API
-            try:
-                account_response = self.ses_client.ses_client.get_account()
-                account_details.update(account_response)
-            except Exception as e:
-                # Set default values if account info is not available
-                account_details['EnforcementStatus'] = 'Unknown'
-                account_details['ProductionAccessEnabled'] = False
-                account_details['SendQuota'] = {
-                    'Max24HourSend': 'N/A',
-                    'MaxSendRate': 'N/A', 
-                    'SentLast24Hours': 'N/A'
-                }
-            
-            # Get suppression list info using SES v2 API
-            try:
-                suppression_response = self.ses_client.ses_client.list_suppressed_destinations()
-                account_details['SuppressionListCount'] = len(suppression_response.get('SuppressedDestinationSummaries', []))
-            except Exception as e:
-                account_details['SuppressionListCount'] = 'N/A'
-            
-            return account_details
-            
+        logger = get_logger()
+        account_details = {}
+        
+        # Account details and suppression count are cached separately by the SES client,
+        # so a failure in one is shown as placeholders here instead of being cached
         try:
-            # Use cached API wrapper for account details
-            ttl_minutes = settings.get('cache.dashboard_ttl_minutes', 10)
-            self.account_details = self.cached_api.cached_call(
-                operation_name="get_account_details",
-                api_function=_fetch_account_details,
-                ttl_minutes=ttl_minutes,
-                force_refresh=force_refresh
-            )
-                
+            account_details.update(self.ses_client.get_account_details(force_refresh=force_refresh))
         except Exception as e:
-            self.app.notify(f"Error fetching account details: {str(e)}", severity="error")
-            self.account_details = {}
+            if logger:
+                logger.warning(str(e), "DASHBOARD")
+            # Set default values if account info is not available
+            account_details['EnforcementStatus'] = 'Unknown'
+            account_details['ProductionAccessEnabled'] = False
+            account_details['SendQuota'] = {
+                'Max24HourSend': 'N/A',
+                'MaxSendRate': 'N/A', 
+                'SentLast24Hours': 'N/A'
+            }
+        
+        try:
+            suppression = self.ses_client.get_suppression_count(force_refresh=force_refresh)
+            account_details['SuppressionListCount'] = suppression['count']
+            account_details['SuppressionListHasMore'] = suppression['has_more']
+        except Exception as e:
+            if logger:
+                logger.warning(str(e), "DASHBOARD")
+            account_details['SuppressionListCount'] = 'N/A'
+        
+        self.account_details = account_details
     
     async def refresh_metrics_data(self, time_period: str = "24h", force_refresh: bool = False) -> None:
         """Refresh CloudWatch metrics data with caching support."""
-        if not self.cloudwatch_client:
+        if not self.cloudwatch_client or not self.ses_client:
             return
         
         def _fetch_metrics_data(time_period=time_period):
@@ -212,12 +196,14 @@ class DashboardManager:
             # Use cached API wrapper for metrics data
             ttl_minutes = settings.get('cache.metrics_ttl_minutes', 5)
             params = {'time_period': time_period}
-            self.metrics_data = self.cached_api.cached_call(
+            self.metrics_data = self.ses_client.cached_api.cached_call(
                 operation_name="get_metrics_data",
                 api_function=_fetch_metrics_data,
                 params=params,
                 ttl_minutes=ttl_minutes,
-                force_refresh=force_refresh
+                force_refresh=force_refresh,
+                # Don't cache results where some metrics failed to load
+                cache_if=lambda data: all(metric['value'] != 'Error' for metric in data.values())
             )
                     
         except Exception as e:
@@ -305,7 +291,8 @@ class DashboardManager:
         # Suppression list info
         suppression_count = self.account_details.get('SuppressionListCount', 'N/A')
         if isinstance(suppression_count, int):
-            suppression_text = f"{suppression_count:,} addresses"
+            more = "+" if self.account_details.get('SuppressionListHasMore') else ""
+            suppression_text = f"{suppression_count:,}{more} addresses"
         else:
             suppression_text = str(suppression_count)
         table.add_row("🚫 Suppression List", suppression_text)

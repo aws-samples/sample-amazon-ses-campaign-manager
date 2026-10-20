@@ -829,21 +829,13 @@ class EmailComposer:
             max_account_rate = 1
             
             try:
-                # Try to get the max rate from cached account details
-                from modules.cache_manager import CacheManager
-                
-                cache_manager = CacheManager(settings)
-                cached_account = cache_manager.get_cached_data("get_account_details")
-                
-                # If no cache exists, fetch fresh account details
-                if not cached_account and self.ses_client:
+                # Try to get the max rate from account details (cached per account/region by the SES client)
+                cached_account = None
+                if self.ses_client:
                     try:
-                        account_response = self.ses_client.ses_client.get_account()
-                        cached_account = account_response
-                        # Cache it for future use
-                        cache_manager.set_cached_data("get_account_details", cached_account)
+                        cached_account = self.ses_client.get_account_details()
                     except Exception:
-                        pass  # nosec B110 - Intentional - widget may not be mounted
+                        pass  # nosec B110 - Intentional - fall back to default rate if account details are unavailable
                 
                 # Extract MaxSendRate from cached or fresh data
                 if cached_account and 'SendQuota' in cached_account:
